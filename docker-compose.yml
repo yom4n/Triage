@@ -1,0 +1,59 @@
+services:
+  postgres:
+    # pgvector/pgvector ships stock PostgreSQL 16 with the pgvector extension
+    # pre-installed, so semantic search over past tickets can live in the
+    # same transactional database as the rest of the app -- no separate
+    # vector-DB service, no cross-store consistency problems.
+    image: pgvector/pgvector:pg16
+    container_name: triage_postgres
+    restart: unless-stopped
+    ports:
+      - "55432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-triage_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-triage_password}
+      POSTGRES_DB: ${POSTGRES_DB:-triage_engine}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Runs once against an empty data directory to enable the `vector`
+      # extension before the app ever connects.
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-triage_user} -d ${POSTGRES_DB:-triage_engine}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - triage_net
+
+  redis:
+    # Backs the LangGraph checkpointer: every node write is persisted here,
+    # so a crashed/restarted server can resume a ticket's triage run from
+    # its last completed step instead of starting over.
+    image: redis:alpine
+    container_name: triage_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    # --appendonly yes enables AOF persistence so checkpoint state survives
+    # a container restart, not just a graceful process exit.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks:
+      - triage_net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  triage_net:
+    driver: bridge
