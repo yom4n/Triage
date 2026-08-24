@@ -24,9 +24,11 @@ import logging
 from typing import TypeVar
 
 import httpx
+from opentelemetry import trace
 from pydantic import BaseModel, ValidationError
 
 from app.config import get_settings
+from app.services.telemetry import get_tracer, record_llm_usage
 
 logger = logging.getLogger("triage_engine.llm")
 
@@ -91,40 +93,75 @@ async def _call_ollama_structured(*, system: str, user: str, schema_model: type[
         "options": {"temperature": 0.1},
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-    except httpx.TimeoutException as exc:
-        raise LLMTimeoutError(
-            f"Ollama chat request timed out after {settings.llm_timeout_seconds}s "
-            f"(model={settings.ollama_chat_model}). A 7B model can be slow on CPU-only "
-            "hardware; raise LLM_TIMEOUT_SECONDS or use a smaller model."
-        ) from exc
-    except httpx.ConnectError as exc:
-        raise LLMTimeoutError(
-            f"Could not reach Ollama at {settings.ollama_base_url}. "
-            "Start it with `ollama serve`, and ensure the model is pulled: "
-            f"`ollama pull {settings.ollama_chat_model}`."
-        ) from exc
-    except httpx.HTTPStatusError as exc:
-        raise LLMError(
-            f"Ollama chat request failed with {exc.response.status_code}: {exc.response.text[:300]}"
-        ) from exc
+    # `llm.call` nests under whichever `graph.node.*` span is currently
+    # active (see telemetry.py's module docstring on context propagation),
+    # and separately from that node's own duration, so a trace can show
+    # "log_inspector_node took 4.2s, of which 3.9s was the Ollama call
+    # itself" instead of one lump figure.
+    tracer = get_tracer()
+    with tracer.start_as_current_span("llm.call") as span:
+        span.set_attribute("llm.provider", "ollama")
+        span.set_attribute("llm.model", settings.ollama_chat_model)
 
-    body = response.json()
-    try:
-        content = body["message"]["content"]
-    except (KeyError, TypeError) as exc:
-        raise LLMMalformedOutputError(f"Unexpected Ollama response shape: {body!r}") from exc
+        try:
+            async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "timeout"))
+            raise LLMTimeoutError(
+                f"Ollama chat request timed out after {settings.llm_timeout_seconds}s "
+                f"(model={settings.ollama_chat_model}). A 7B model can be slow on CPU-only "
+                "hardware; raise LLM_TIMEOUT_SECONDS or use a smaller model."
+            ) from exc
+        except httpx.ConnectError as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "connect_error"))
+            raise LLMTimeoutError(
+                f"Could not reach Ollama at {settings.ollama_base_url}. "
+                "Start it with `ollama serve`, and ensure the model is pulled: "
+                f"`ollama pull {settings.ollama_chat_model}`."
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, f"http_{exc.response.status_code}"))
+            raise LLMError(
+                f"Ollama chat request failed with {exc.response.status_code}: {exc.response.text[:300]}"
+            ) from exc
 
-    try:
-        return schema_model.model_validate_json(content)
-    except (ValidationError, json.JSONDecodeError) as exc:
-        raise LLMMalformedOutputError(
-            f"Ollama returned output that failed {schema_model.__name__} validation: "
-            f"{content[:500]!r} ({exc})"
-        ) from exc
+        body = response.json()
+        # Ollama's non-streaming /api/chat response reports token counts as
+        # prompt_eval_count (input) / eval_count (output) -- record them
+        # regardless of what happens next so a malformed-output failure
+        # still shows the tokens actually spent on the wasted call.
+        record_llm_usage(
+            span,
+            provider="ollama",
+            model=settings.ollama_chat_model,
+            prompt_tokens=body.get("prompt_eval_count"),
+            completion_tokens=body.get("eval_count"),
+        )
+
+        try:
+            content = body["message"]["content"]
+        except (KeyError, TypeError) as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "malformed_response_shape"))
+            raise LLMMalformedOutputError(f"Unexpected Ollama response shape: {body!r}") from exc
+
+        try:
+            parsed = schema_model.model_validate_json(content)
+        except (ValidationError, json.JSONDecodeError) as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "schema_validation_failed"))
+            raise LLMMalformedOutputError(
+                f"Ollama returned output that failed {schema_model.__name__} validation: "
+                f"{content[:500]!r} ({exc})"
+            ) from exc
+
+        span.set_status(trace.Status(trace.StatusCode.OK))
+        return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -176,42 +213,71 @@ async def _call_anthropic_structured(*, system: str, user: str, schema_model: ty
     settings = get_settings()
     client = _get_anthropic_client()
 
-    try:
-        # with_options(timeout=...) uses the SDK's own request-timeout
-        # machinery rather than wrapping the call in asyncio.wait_for,
-        # so retry/connection-pool behavior stays exactly what the SDK
-        # authors intended.
-        response = await client.with_options(timeout=settings.llm_timeout_seconds).messages.parse(
-            model=settings.anthropic_model,
-            max_tokens=2048,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            output_format=schema_model,
-        )
-    # Most-specific-first exception chain (see the Anthropic API skill's
-    # error-handling guidance) so timeouts, rate limits, and generic API
-    # errors are distinguishable to the caller/retry logic below.
-    except anthropic.APITimeoutError as exc:
-        raise LLMTimeoutError(
-            f"Anthropic request timed out after {settings.llm_timeout_seconds}s"
-        ) from exc
-    except anthropic.RateLimitError as exc:
-        raise LLMError(f"Anthropic rate limit exceeded: {exc}") from exc
-    except anthropic.APIConnectionError as exc:
-        raise LLMTimeoutError(f"Could not reach the Anthropic API: {exc}") from exc
-    except anthropic.APIStatusError as exc:
-        raise LLMError(f"Anthropic API error ({exc.status_code}): {exc.message}") from exc
+    tracer = get_tracer()
+    with tracer.start_as_current_span("llm.call") as span:
+        span.set_attribute("llm.provider", "anthropic")
+        span.set_attribute("llm.model", settings.anthropic_model)
 
-    if response.stop_reason == "refusal":
-        raise LLMMalformedOutputError(
-            f"Anthropic declined the request (stop_details={response.stop_details})"
+        try:
+            # with_options(timeout=...) uses the SDK's own request-timeout
+            # machinery rather than wrapping the call in asyncio.wait_for,
+            # so retry/connection-pool behavior stays exactly what the SDK
+            # authors intended.
+            response = await client.with_options(timeout=settings.llm_timeout_seconds).messages.parse(
+                model=settings.anthropic_model,
+                max_tokens=2048,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+                output_format=schema_model,
+            )
+        # Most-specific-first exception chain (see the Anthropic API skill's
+        # error-handling guidance) so timeouts, rate limits, and generic API
+        # errors are distinguishable to the caller/retry logic below.
+        except anthropic.APITimeoutError as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "timeout"))
+            raise LLMTimeoutError(
+                f"Anthropic request timed out after {settings.llm_timeout_seconds}s"
+            ) from exc
+        except anthropic.RateLimitError as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "rate_limited"))
+            raise LLMError(f"Anthropic rate limit exceeded: {exc}") from exc
+        except anthropic.APIConnectionError as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "connect_error"))
+            raise LLMTimeoutError(f"Could not reach the Anthropic API: {exc}") from exc
+        except anthropic.APIStatusError as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, f"http_{exc.status_code}"))
+            raise LLMError(f"Anthropic API error ({exc.status_code}): {exc.message}") from exc
+
+        # Anthropic reports usage on every response regardless of outcome,
+        # so this runs before the refusal/parse checks below -- a refused
+        # or malformed reply still cost real input/output tokens.
+        usage = getattr(response, "usage", None)
+        record_llm_usage(
+            span,
+            provider="anthropic",
+            model=settings.anthropic_model,
+            prompt_tokens=getattr(usage, "input_tokens", None),
+            completion_tokens=getattr(usage, "output_tokens", None),
         )
-    if response.parsed_output is None:
-        raise LLMMalformedOutputError(
-            f"Anthropic response did not include a valid {schema_model.__name__} "
-            f"(stop_reason={response.stop_reason})"
-        )
-    return response.parsed_output
+
+        if response.stop_reason == "refusal":
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "refusal"))
+            raise LLMMalformedOutputError(
+                f"Anthropic declined the request (stop_details={response.stop_details})"
+            )
+        if response.parsed_output is None:
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "unparseable_output"))
+            raise LLMMalformedOutputError(
+                f"Anthropic response did not include a valid {schema_model.__name__} "
+                f"(stop_reason={response.stop_reason})"
+            )
+
+        span.set_status(trace.Status(trace.StatusCode.OK))
+        return response.parsed_output
 
 
 # ---------------------------------------------------------------------------

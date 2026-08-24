@@ -37,6 +37,7 @@ from app.schemas import EnvironmentEnum, SeverityEnum
 from app.services.embeddings import EmbeddingError, generate_embedding
 from app.services.llm import LLMError, call_structured
 from app.services.rag import find_similar_tickets
+from app.services.telemetry import traced_node
 
 logger = logging.getLogger("triage_engine.graph")
 
@@ -85,6 +86,11 @@ class TicketState(TypedDict):
     resolution_steps: list[str]
     triage_confidence: float
     used_llm_triage_router: bool
+
+    # -- Populated by triage_router_node (default) or overwritten by
+    #    fallback_human_escalation_node when routed there -------------------
+    status: str  # "COMPLETED" | "ESCALATED_TO_HUMAN"
+    escalation_reason: str
 
 
 # ===========================================================================
@@ -179,6 +185,7 @@ def _fallback_extract_error(trace: str) -> str:
     return first_line[:200] or "UnknownError"
 
 
+@traced_node("log_inspector")
 async def log_inspector_node(state: TicketState) -> dict:
     """
     Node 1: use LLM reasoning to isolate the root exception, the file/line
@@ -236,6 +243,7 @@ async def log_inspector_node(state: TicketState) -> dict:
 # ===========================================================================
 
 
+@traced_node("rag_lookup")
 async def rag_lookup_node(state: TicketState, config: RunnableConfig) -> dict:
     """
     Node 2: retrieve verified historical tickets whose root cause resembles
@@ -382,6 +390,7 @@ def _format_retrieved_context(retrieved_context: list[RetrievedTicket]) -> str:
     return "\n".join(lines)
 
 
+@traced_node("triage_router")
 async def triage_router_node(state: TicketState) -> dict:
     """
     Node 3: use LLM reasoning -- grounded in the historical tickets
@@ -419,6 +428,11 @@ async def triage_router_node(state: TicketState) -> dict:
             "resolution_steps": result.resolution_steps,
             "triage_confidence": result.confidence,
             "used_llm_triage_router": True,
+            # Provisional -- `_route_after_triage` below overrides this to
+            # ESCALATED_TO_HUMAN if `result.confidence` is still under
+            # `settings.min_confidence` despite the LLM call succeeding.
+            "status": "COMPLETED",
+            "escalation_reason": "",
         }
     except LLMError as exc:
         logger.warning(
@@ -444,7 +458,75 @@ async def triage_router_node(state: TicketState) -> dict:
             ],
             "triage_confidence": 0.0,
             "used_llm_triage_router": False,
+            # `used_llm_triage_router: False` alone is what
+            # `_route_after_triage` keys off of to divert to
+            # fallback_human_escalation_node -- status/escalation_reason
+            # here are just provisional placeholders it overwrites.
+            "status": "COMPLETED",
+            "escalation_reason": "",
         }
+
+
+# ===========================================================================
+# Node 4: fallback_human_escalation_node
+# ===========================================================================
+
+
+@traced_node("fallback_human_escalation")
+async def fallback_human_escalation_node(state: TicketState) -> dict:
+    """
+    Terminal safety-net node: reached only via the conditional edge out of
+    triage_router_node (see `_route_after_triage`), never directly wired
+    from START.
+
+    This is the "never crash or hang on upstream API outages" guarantee
+    made concrete: whatever partial diagnosis the pipeline managed to
+    produce (extracted error, RAG hits, a rule-based severity guess) is
+    preserved rather than discarded, but the ticket is explicitly marked
+    `ESCALATED_TO_HUMAN` and its resolution_steps are replaced with a
+    single honest instruction to get a human involved -- callers must
+    never receive a low-confidence or rule-based guess dressed up to look
+    like a fully-reasoned LLM triage result. No exception is raised and no
+    ticket data is dropped: main.py still persists this state to Postgres
+    exactly like a normal completion, just with `status="ESCALATED_TO_HUMAN"`.
+    """
+    settings = get_settings()
+
+    reasons: list[str] = []
+    if not state.get("used_llm_triage_router", False):
+        reasons.append(
+            "LLM triage reasoning was unavailable (timeout, malformed output, "
+            "or backend outage) -- the pipeline fell back to rule-based "
+            "classification, which is not trustworthy enough to auto-resolve."
+        )
+    triage_confidence = state.get("triage_confidence", 0.0)
+    if triage_confidence < settings.min_confidence:
+        reasons.append(
+            f"triage confidence {triage_confidence:.2f} is below the "
+            f"{settings.min_confidence:.2f} floor required for an automated resolution."
+        )
+    escalation_reason = " ".join(reasons) or "Escalated per policy (reason unspecified)."
+
+    logger.warning(
+        "fallback_human_escalation_node: ticket %s escalated to human review -- %s",
+        state["ticket_id"], escalation_reason,
+    )
+
+    escalation_note = (
+        "This ticket has been escalated to a human Tier-2/3 engineer for manual "
+        f"review. Reason: {escalation_reason} No automated resolution steps were applied."
+    )
+
+    return {
+        "status": "ESCALATED_TO_HUMAN",
+        "escalation_reason": escalation_reason,
+        # Deliberately overwrite whatever resolution_steps/summary the
+        # failed or low-confidence attempt produced -- a caller reading
+        # only `resolution_steps` must never mistake a discarded guess for
+        # an actionable fix.
+        "resolution_steps": [escalation_note],
+        "summary": state.get("summary") or escalation_note,
+    }
 
 
 # ===========================================================================
@@ -452,18 +534,51 @@ async def triage_router_node(state: TicketState) -> dict:
 # ===========================================================================
 
 
+def _route_after_triage(state: TicketState) -> str:
+    """
+    Conditional-edge function evaluated after triage_router_node completes.
+
+    Diverts to fallback_human_escalation_node when either signal fires:
+      * the LLM call never succeeded at all (timeout, malformed output
+        after retries, or the backend was unreachable) -- triage_router_node
+        already caught that internally and returned the rule-based
+        fallback with `used_llm_triage_router=False`;
+      * the LLM call succeeded but self-reported a confidence below
+        `settings.min_confidence` -- a syntactically valid answer the
+        model itself isn't confident in is exactly the case Day 4 asks
+        to route to a human rather than return as-is.
+
+    Otherwise the ticket is a normal, confident, LLM-grounded triage and
+    proceeds straight to END.
+    """
+    settings = get_settings()
+    llm_failed = not state.get("used_llm_triage_router", False)
+    low_confidence = state.get("triage_confidence", 0.0) < settings.min_confidence
+    if llm_failed or low_confidence:
+        return "fallback_human_escalation"
+    return "__end__"
+
+
 def build_triage_graph(checkpointer=None):
     """
     Assemble and compile the StateGraph:
 
-        START -> log_inspector_node -> rag_lookup_node -> triage_router_node -> END
+        START -> log_inspector_node -> rag_lookup_node -> triage_router_node -+-> END
+                                                                                +-> fallback_human_escalation_node -> END
 
-    The linear edges (rather than conditional routing) guarantee LangGraph
-    never runs a node until every edge feeding it has fired: rag_lookup_node
-    never embeds a raw, un-sanitized stack trace (it only sees the cleaned
-    `embedding_query`/`extracted_error` log_inspector_node already wrote),
-    and triage_router_node never reasons without first having a chance at
-    retrieved historical context.
+    The first three edges stay linear/unconditional (rather than
+    conditional routing) so LangGraph never runs a node until every edge
+    feeding it has fired: rag_lookup_node never embeds a raw, un-sanitized
+    stack trace (it only sees the cleaned `embedding_query`/`extracted_error`
+    log_inspector_node already wrote), and triage_router_node never reasons
+    without first having a chance at retrieved historical context.
+
+    The branch out of triage_router_node *is* conditional: `_route_after_triage`
+    inspects the just-written state and either lets the ticket complete
+    normally or diverts it to fallback_human_escalation_node, which always
+    terminates the graph afterward -- there is no path back into the
+    pipeline, so escalation is always a clean, single-step terminal state
+    rather than a retry loop that could hang a request.
 
     `checkpointer` is injected rather than constructed here because its
     backing Redis connection must be opened inside an async context
@@ -476,10 +591,16 @@ def build_triage_graph(checkpointer=None):
     workflow.add_node("log_inspector", log_inspector_node)
     workflow.add_node("rag_lookup", rag_lookup_node)
     workflow.add_node("triage_router", triage_router_node)
+    workflow.add_node("fallback_human_escalation", fallback_human_escalation_node)
 
     workflow.add_edge(START, "log_inspector")
     workflow.add_edge("log_inspector", "rag_lookup")
     workflow.add_edge("rag_lookup", "triage_router")
-    workflow.add_edge("triage_router", END)
+    workflow.add_conditional_edges(
+        "triage_router",
+        _route_after_triage,
+        {"fallback_human_escalation": "fallback_human_escalation", "__end__": END},
+    )
+    workflow.add_edge("fallback_human_escalation", END)
 
     return workflow.compile(checkpointer=checkpointer)

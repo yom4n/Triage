@@ -32,6 +32,23 @@ class SeverityEnum(str, Enum):
     LOW = "LOW"
 
 
+class TriageStatusEnum(str, Enum):
+    """
+    Final disposition of a triage run.
+
+    COMPLETED         -- an LLM-grounded triage result at or above
+                          `settings.min_confidence`; safe to act on directly.
+    ESCALATED_TO_HUMAN -- fallback_human_escalation_node fired (see
+                          app/graph.py's `_route_after_triage`): the LLM
+                          call timed out / returned malformed output /
+                          yielded low confidence. `resolution_steps` holds
+                          a single hand-off instruction, not an automated fix.
+    """
+
+    COMPLETED = "COMPLETED"
+    ESCALATED_TO_HUMAN = "ESCALATED_TO_HUMAN"
+
+
 # Extremely low-effort reports ("it broke", "bug pls fix") almost never
 # contain a real error signature. Requiring a minimum length forces the
 # reporter to paste an actual stack trace / log excerpt worth analyzing.
@@ -139,4 +156,10 @@ class TicketResponse(BaseModel):
     # used to ground this recommendation -- 0 means the LLM reasoned from
     # the stack trace alone, with no matching precedent in the corpus.
     similar_tickets_considered: int = 0
+    # Day 4: final disposition after fallback_human_escalation_node's
+    # conditional routing (app/graph.py's `_route_after_triage`). Callers
+    # should branch on this before trusting `resolution_steps` as an
+    # automated fix -- ESCALATED_TO_HUMAN means it is a hand-off note.
+    status: TriageStatusEnum = TriageStatusEnum.COMPLETED
+    escalation_reason: str | None = None
     created_at: datetime

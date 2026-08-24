@@ -14,17 +14,63 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+from pydantic import ValidationError as PydanticValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import Ticket, dispose_engine, get_db, init_models
 from app.graph import TicketState, build_triage_graph
-from app.schemas import SeverityEnum, TicketCreate, TicketResponse
+from app.schemas import SeverityEnum, TicketCreate, TicketResponse, TriageStatusEnum
 from app.services.embeddings import EmbeddingError, build_embedding_text, generate_embedding, warn_if_deterministic
+from app.services.llm import LLMError, LLMMalformedOutputError, LLMTimeoutError
+from app.services.telemetry import current_trace_id, instrument_fastapi_app, setup_telemetry, shutdown_telemetry
 
 logging.basicConfig(level=get_settings().log_level)
 logger = logging.getLogger("triage_engine")
+
+
+# ===========================================================================
+# RFC 7807 (application/problem+json) error contract
+# ===========================================================================
+#
+# Every handler below returns the same shape so a client system only has to
+# write one deserializer for every error this API can produce, and an
+# on-call engineer can always find `trace_id` in the same place regardless
+# of which exception fired. `type` is a stable, greppable slug (not a real
+# dereferenceable URL -- RFC 7807 only requires it be a URI *identifier*,
+# not that it resolves) an engineer can search runbooks/dashboards for.
+
+_PROBLEM_BASE_TYPE = "https://triage-engine.internal/errors"
+
+
+def _problem_response(*, status_code: int, title: str, detail: str, type_slug: str, request: Request) -> JSONResponse:
+    """
+    Build one RFC 7807 problem-details response, stamped with the current
+    OpenTelemetry trace ID.
+
+    `trace_id` is the whole point of pairing structured error logging with
+    tracing: this same ID is on the span FastAPIInstrumentor opened for
+    this request (see app/services/telemetry.py), so an on-call engineer
+    can copy it straight from a client-reported 500 into the tracing
+    backend and land on the exact request -- no timestamp-based log
+    grepping required.
+    """
+    trace_id = current_trace_id()
+    return JSONResponse(
+        status_code=status_code,
+        media_type="application/problem+json",
+        content={
+            "type": f"{_PROBLEM_BASE_TYPE}/{type_slug}",
+            "title": title,
+            "status": status_code,
+            "detail": detail,
+            "instance": str(request.url),
+            "trace_id": trace_id or "unavailable",
+        },
+    )
 
 
 @asynccontextmanager
@@ -48,6 +94,15 @@ async def lifespan(app: FastAPI):
     logger.info(
         "Postgres schema ready at %s:%s/%s", settings.postgres_host, settings.postgres_port, settings.postgres_db
     )
+
+    # 1b. Build the TracerProvider/exporter and instrument the SQLAlchemy
+    #     engine `init_models()` just built. FastAPI's own instrumentation
+    #     is NOT done here -- `instrument_fastapi_app(app)` already ran at
+    #     module import time, right after `app = FastAPI(...)` below, for
+    #     reasons documented on that function (a Starlette middleware-
+    #     stack caching trap that silently no-ops tracing if instrumented
+    #     from inside this startup hook instead).
+    setup_telemetry()
 
     # 2. Loudly flag a non-semantic embedding configuration -- silent
     #    misconfiguration here would make RAG retrieval look "broken" for
@@ -83,23 +138,160 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         # Reverse order of acquisition: close Redis first, then drain the
-        # Postgres connection pool.
+        # Postgres connection pool, then flush any spans still buffered in
+        # the OTel BatchSpanProcessor so a graceful shutdown doesn't lose
+        # the trace for whatever request was in flight when it started.
         await redis_checkpointer_cm.__aexit__(None, None, None)
         await dispose_engine()
+        shutdown_telemetry()
 
 
 app = FastAPI(
     title="Autonomous Tier-1 Technical Support & Triage Engine",
-    description="Phase 2: LLM reasoning + pgvector RAG over the LangGraph triage pipeline.",
-    version="0.2.0",
+    description=(
+        "Phase 3 (Day 4): LLM reasoning + pgvector RAG over the LangGraph "
+        "triage pipeline, with OpenTelemetry tracing, a human-escalation "
+        "fallback node, and RFC 7807 structured error responses."
+    ),
+    version="0.3.0",
     lifespan=lifespan,
 )
+
+# Must run immediately after construction, before this app ever handles its
+# first ASGI call (including the "lifespan" call itself) -- see
+# `instrument_fastapi_app`'s docstring in app/services/telemetry.py for why
+# calling this from inside `lifespan()` above would silently produce zero
+# request tracing.
+instrument_fastapi_app(app)
 
 
 @app.get("/health", tags=["ops"])
 async def health() -> dict:
     """Liveness probe. Deliberately avoids touching Postgres/Redis/Ollama so it stays cheap."""
     return {"status": "ok"}
+
+
+# ===========================================================================
+# Global exception handlers (Day 4)
+# ===========================================================================
+#
+# Registration order does not matter to Starlette's dispatcher -- it always
+# picks the most specific matching handler for the exception's actual type
+# (walking the MRO), so `SQLAlchemyError`/`LLMTimeoutError`/`LLMMalformedOutputError`
+# below are each tried before the catch-all `Exception` handler regardless
+# of where they're declared. Most of these exception types are already
+# caught *inside* the LangGraph nodes that can raise them (see
+# app/graph.py's per-node try/except LLMError blocks) as part of the
+# graceful-degradation design -- these handlers exist for whatever gets
+# past that: a DB failure during the final `db.commit()`/`db.refresh()`
+# below (outside the graph's own try/except), a future endpoint that
+# doesn't wrap its own DB/LLM calls, or a genuinely unanticipated bug.
+
+
+@app.exception_handler(SQLAlchemyError)
+async def database_error_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
+    """
+    Any Postgres-layer failure -- a dropped connection, a pool exhausted,
+    a constraint violation -- surfaces here as a 503: the *engine* is fine,
+    but this specific dependency is unavailable right now, which is what
+    tells a well-behaved client "retry with backoff" rather than "give up".
+    """
+    trace_id = current_trace_id()
+    logger.error("Database error [trace_id=%s]: %s", trace_id, exc, exc_info=True)
+    return _problem_response(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        title="Database Unavailable",
+        detail=(
+            "The triage engine could not complete a database operation. "
+            "This is very likely transient (a dropped connection or an "
+            "exhausted pool) -- retry with exponential backoff."
+        ),
+        type_slug="database-error",
+        request=request,
+    )
+
+
+@app.exception_handler(LLMTimeoutError)
+async def llm_timeout_handler(request: Request, exc: LLMTimeoutError) -> JSONResponse:
+    """
+    The configured LLM backend didn't answer within `settings.llm_timeout_seconds`
+    (or the backend was flat-out unreachable). Note: inside the triage
+    pipeline itself this is caught by log_inspector_node/triage_router_node
+    and degrades to the rule-based fallback path instead of ever reaching
+    here (see app/graph.py) -- this handler is what fires if an LLM call
+    is ever made *outside* that guarded path.
+    """
+    trace_id = current_trace_id()
+    logger.error("LLM timeout [trace_id=%s]: %s", trace_id, exc, exc_info=True)
+    return _problem_response(
+        status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        title="LLM Backend Timeout",
+        detail=f"The upstream LLM provider did not respond in time: {exc}",
+        type_slug="llm-timeout",
+        request=request,
+    )
+
+
+@app.exception_handler(LLMMalformedOutputError)
+async def llm_schema_validation_handler(request: Request, exc: LLMMalformedOutputError) -> JSONResponse:
+    """
+    The LLM backend responded, but its output didn't validate against the
+    Pydantic schema the calling node required (app/services/llm.py's
+    `call_structured` already retried `settings.llm_max_retries` times
+    before giving up). Treated as a 502: the upstream dependency returned
+    a response we cannot trust, not a fault of the caller's request.
+    """
+    trace_id = current_trace_id()
+    logger.error("LLM schema validation failed [trace_id=%s]: %s", trace_id, exc, exc_info=True)
+    return _problem_response(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        title="LLM Output Schema Validation Failed",
+        detail=f"The upstream LLM provider returned output that failed schema validation: {exc}",
+        type_slug="llm-schema-validation-error",
+        request=request,
+    )
+
+
+@app.exception_handler(PydanticValidationError)
+async def schema_validation_handler(request: Request, exc: PydanticValidationError) -> JSONResponse:
+    """
+    Catches Pydantic `ValidationError` raised *outside* FastAPI's own
+    request-body validation (which already returns its own 422 via
+    `RequestValidationError`/`fastapi.exception_handlers.request_validation_exception_handler`
+    and is left untouched) -- e.g. a `TicketResponse` or an internal
+    `BaseModel` failing to construct from data this service itself
+    produced. That is always a server-side contract bug, so it is a 500,
+    not a 422 -- the caller's request was fine.
+    """
+    trace_id = current_trace_id()
+    logger.error("Internal schema validation error [trace_id=%s]: %s", trace_id, exc, exc_info=True)
+    return _problem_response(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        title="Internal Schema Validation Error",
+        detail=f"A response failed internal schema validation: {exc}",
+        type_slug="schema-validation-error",
+        request=request,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Last-resort catch-all: guarantees this API *never* returns a bare,
+    unstructured 500 with a stack trace leaked into the response body.
+    Every unanticipated failure still gets a well-formed RFC 7807 body and
+    a trace_id an on-call engineer can search for -- the alternative is a
+    generic ASGI error page that reveals nothing actionable.
+    """
+    trace_id = current_trace_id()
+    logger.exception("Unhandled exception [trace_id=%s]", trace_id)
+    return _problem_response(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        title="Internal Server Error",
+        detail="An unexpected error occurred while processing this request.",
+        type_slug="internal-error",
+        request=request,
+    )
 
 
 @app.post(
@@ -158,6 +350,8 @@ async def triage_ticket(
         "resolution_steps": [],
         "triage_confidence": 0.0,
         "used_llm_triage_router": False,
+        "status": "COMPLETED",
+        "escalation_reason": "",
     }
 
     graph = request.app.state.triage_graph
@@ -178,8 +372,22 @@ async def triage_ticket(
         # ainvoke is the async entrypoint into the compiled graph -- it
         # awaits each node in turn (log_inspector -> rag_lookup ->
         # triage_router), checkpointing state to Redis after every node
-        # completes.
+        # completes. LLM failures never reach here: log_inspector_node and
+        # triage_router_node each catch LLMError internally and degrade to
+        # their rule-based fallback (see app/graph.py), and a low- or
+        # zero-confidence result is diverted to fallback_human_escalation_node
+        # by the graph's own conditional routing rather than raising.
         result_state: TicketState = await graph.ainvoke(initial_state, config=run_config)
+    except SQLAlchemyError:
+        # A genuine DB-layer failure (e.g. rag_lookup_node's pgvector
+        # query hitting a dropped connection) is NOT something a node can
+        # gracefully fall back from -- there is no rule-based substitute
+        # for "the database is unreachable". Re-raise so it's handled by
+        # `database_error_handler` above instead of being flattened into
+        # this function's generic 502, so callers get the correct 503 +
+        # RFC 7807 body and this failure mode is distinguishable from an
+        # LLM/pipeline-logic failure in logs and traces alike.
+        raise
     except Exception:
         logger.exception("Triage pipeline failed for ticket %s", ticket_id)
         raise HTTPException(
@@ -206,6 +414,13 @@ async def triage_ticket(
         # human confirms the resolution actually worked. See
         # app/services/rag.py's `require_verified` gate.
         is_verified=False,
+        # Day 4: whatever fallback_human_escalation_node's conditional
+        # routing decided (app/graph.py's `_route_after_triage`) is
+        # persisted verbatim -- an escalated ticket is still a completed,
+        # storable record, just one flagged for human follow-up rather
+        # than treated as an automated resolution.
+        status=result_state.get("status", "COMPLETED"),
+        escalation_reason=result_state.get("escalation_reason") or None,
     )
 
     # Embed the ticket we just triaged so it becomes retrievable once
@@ -240,5 +455,7 @@ async def triage_ticket(
         resolution_steps=ticket_record.resolution_steps,
         confidence=ticket_record.confidence or 0.0,
         similar_tickets_considered=len(result_state.get("retrieved_context", [])),
+        status=TriageStatusEnum(ticket_record.status),
+        escalation_reason=ticket_record.escalation_reason,
         created_at=ticket_record.created_at,
     )

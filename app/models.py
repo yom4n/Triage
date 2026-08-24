@@ -68,6 +68,13 @@ class Ticket(Base):
     )
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # -- Written by fallback_human_escalation_node (Day 4), or defaulted to
+    #    "COMPLETED" for a normal, confident, LLM-grounded triage --------
+    status: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="COMPLETED", server_default="COMPLETED", index=True
+    )
+    escalation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # -- RAG corpus fields ---------------------------------------------------
     # The verified fix. This is the payload retrieval exists to surface --
     # `extracted_error` tells the router *what* broke before, `resolution`
