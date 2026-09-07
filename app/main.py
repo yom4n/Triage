@@ -13,17 +13,27 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from pydantic import ValidationError as PydanticValidationError
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import Ticket, dispose_engine, get_db, init_models
 from app.graph import TicketState, build_triage_graph
-from app.schemas import SeverityEnum, TicketCreate, TicketResponse, TriageStatusEnum
+from app.schemas import (
+    CrashReport,
+    EnvironmentEnum,
+    SeverityEnum,
+    TicketCreate,
+    TicketResponse,
+    TriageStatusEnum,
+    crash_report_to_ticket_create,
+)
 from app.services.embeddings import EmbeddingError, build_embedding_text, generate_embedding, warn_if_deterministic
 from app.services.llm import LLMError, LLMMalformedOutputError, LLMTimeoutError
 from app.services.telemetry import current_trace_id, instrument_fastapi_app, setup_telemetry, shutdown_telemetry
@@ -164,6 +174,17 @@ app = FastAPI(
 # request tracing.
 instrument_fastapi_app(app)
 
+# Phase 4: /api/v1/ingest/crash is called directly from the monitored app's
+# browser runtime (see client-sdks/), which is a different origin than this
+# API -- without this, the browser blocks the request before it ever leaves
+# the client. `cors_allow_origin_list` defaults to "*" (see app/config.py).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_settings().cors_allow_origin_list,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
 
 @app.get("/health", tags=["ops"])
 async def health() -> dict:
@@ -294,23 +315,69 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     )
 
 
-@app.post(
-    "/api/v1/triage",
-    response_model=TicketResponse,
-    status_code=status.HTTP_201_CREATED,
-    tags=["triage"],
-    summary="Submit a bug report for automated, RAG-grounded Tier-1 triage",
-)
-async def triage_ticket(
+def _ticket_to_response(ticket: Ticket, *, similar_tickets_considered: int = 0) -> TicketResponse:
+    """
+    Build a `TicketResponse` from a persisted `Ticket` row.
+
+    Deliberately not `TicketResponse.model_validate(ticket)`: `from_attributes`
+    only matches identically-named attributes, and the ORM's primary key
+    column is `id`, not `ticket_id` -- a bare `model_validate` call silently
+    raises "ticket_id: Field required" instead of picking it up. Shared by
+    `_run_triage_pipeline` (one ticket, right after creating it) and
+    `list_tickets` (many, read back from the DB) so this mapping exists in
+    exactly one place instead of drifting between two hand-written copies.
+
+    `similar_tickets_considered` has no column on `Ticket` (it's a fact
+    about the triage *run*, not the stored record -- see `TicketState`'s
+    `retrieved_context` in app/graph.py) so it isn't derivable from `ticket`
+    alone; callers reading a ticket back from storage have no run to ask,
+    so it defaults to 0 there.
+    """
+    return TicketResponse(
+        ticket_id=ticket.id,
+        title=ticket.title,
+        environment=EnvironmentEnum(ticket.environment),
+        stack_trace=ticket.stack_trace,
+        extracted_error=ticket.extracted_error,
+        affected_file=ticket.affected_file,
+        affected_line=ticket.affected_line,
+        severity=SeverityEnum(ticket.severity),
+        summary=ticket.summary,
+        resolution_steps=ticket.resolution_steps,
+        confidence=ticket.confidence or 0.0,
+        similar_tickets_considered=similar_tickets_considered,
+        status=TriageStatusEnum(ticket.status),
+        escalation_reason=ticket.escalation_reason,
+        fix_attempted=ticket.fix_attempted,
+        fix_skipped_reason=ticket.fix_skipped_reason,
+        fix_diff=ticket.fix_diff,
+        fix_pr_url=ticket.fix_pr_url,
+        fix_branch_name=ticket.fix_branch_name,
+        fix_verified=ticket.fix_verified,
+        fix_verification_status=ticket.fix_verification_status,
+        fix_verification_attempts=ticket.fix_verification_attempts,
+        fix_test_command=ticket.fix_test_command,
+        fix_test_output_tail=ticket.fix_test_output_tail,
+        created_at=ticket.created_at,
+    )
+
+
+async def _run_triage_pipeline(
     payload: TicketCreate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession,
 ) -> TicketResponse:
     """
-    End-to-end triage flow:
+    End-to-end triage flow, shared by every ingestion route (a human filing
+    a ticket via `POST /api/v1/triage`, or a monitored app's own crash
+    reaching `POST /api/v1/ingest/crash`). Both routes do nothing but
+    produce a valid `TicketCreate` and hand it here -- this function has no
+    idea whether a person or a browser crash hook is the ultimate source,
+    which is exactly the point: the pipeline stays one single code path
+    regardless of how many ingestion adapters feed it.
 
-    1. FastAPI + Pydantic validate/sanitize `payload` against `TicketCreate`
-       (app/schemas.py) before this function body even runs.
+    1. `payload` has already been validated/sanitized against `TicketCreate`
+       (app/schemas.py) by the time it reaches here.
     2. The validated fields seed a `TicketState` and run through the
        compiled LangGraph pipeline (app/graph.py):
          log_inspector_node  -- LLM extracts the root exception + a clean
@@ -352,6 +419,22 @@ async def triage_ticket(
         "used_llm_triage_router": False,
         "status": "COMPLETED",
         "escalation_reason": "",
+        "fix_attempted": False,
+        "fix_skipped_reason": "",
+        "fix_diff": "",
+        "fix_pr_url": "",
+        "fix_branch_name": "",
+        "fix_verified": False,
+        "fix_verification_status": "NOT_ATTEMPTED",
+        "fix_verification_attempts": 0,
+        "fix_test_command": "",
+        "fix_test_output_tail": "",
+        "fix_candidate_content": "",
+        "fix_explanation": "",
+        "fix_llm_confidence": 0.0,
+        "fix_affected_path": "",
+        "fix_original_content": "",
+        "fix_original_sha": "",
     }
 
     graph = request.app.state.triage_graph
@@ -421,6 +504,21 @@ async def triage_ticket(
         # than treated as an automated resolution.
         status=result_state.get("status", "COMPLETED"),
         escalation_reason=result_state.get("escalation_reason") or None,
+        # The fix sub-graph's outcome (app/graph.py) -- absent (all
+        # falsy/None) for an escalated ticket, since that sub-graph is
+        # never reached for one. See app/schemas.py's TicketResponse for
+        # what each field means.
+        fix_attempted=result_state.get("fix_attempted", False),
+        fix_skipped_reason=result_state.get("fix_skipped_reason") or None,
+        fix_diff=result_state.get("fix_diff") or None,
+        fix_pr_url=result_state.get("fix_pr_url") or None,
+        fix_branch_name=result_state.get("fix_branch_name") or None,
+        # Phase 1: sandboxed verification outcome.
+        fix_verified=result_state.get("fix_verified", False),
+        fix_verification_status=result_state.get("fix_verification_status") or "NOT_ATTEMPTED",
+        fix_verification_attempts=result_state.get("fix_verification_attempts", 0),
+        fix_test_command=result_state.get("fix_test_command") or None,
+        fix_test_output_tail=result_state.get("fix_test_output_tail") or None,
     )
 
     # Embed the ticket we just triaged so it becomes retrievable once
@@ -443,19 +541,78 @@ async def triage_ticket(
     await db.commit()
     await db.refresh(ticket_record)
 
-    return TicketResponse(
-        ticket_id=ticket_record.id,
-        title=ticket_record.title,
-        environment=payload.environment,
-        extracted_error=ticket_record.extracted_error,
-        affected_file=ticket_record.affected_file,
-        affected_line=ticket_record.affected_line,
-        severity=SeverityEnum(ticket_record.severity),
-        summary=ticket_record.summary,
-        resolution_steps=ticket_record.resolution_steps,
-        confidence=ticket_record.confidence or 0.0,
-        similar_tickets_considered=len(result_state.get("retrieved_context", [])),
-        status=TriageStatusEnum(ticket_record.status),
-        escalation_reason=ticket_record.escalation_reason,
-        created_at=ticket_record.created_at,
+    return _ticket_to_response(
+        ticket_record, similar_tickets_considered=len(result_state.get("retrieved_context", []))
     )
+
+
+@app.post(
+    "/api/v1/triage",
+    response_model=TicketResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["triage"],
+    summary="Submit a bug report for automated, RAG-grounded Tier-1 triage",
+)
+async def triage_ticket(
+    payload: TicketCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> TicketResponse:
+    """Human/manual entry point -- see `_run_triage_pipeline` for the actual flow."""
+    return await _run_triage_pipeline(payload, request, db)
+
+
+@app.post(
+    "/api/v1/ingest/crash",
+    response_model=TicketResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["triage"],
+    summary="Auto-ticket a crash reported by a monitored app's own client-side capture hook",
+)
+async def ingest_crash_report(
+    report: CrashReport,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> TicketResponse:
+    """
+    Phase 4 entry point: the automated counterpart to `triage_ticket` above.
+
+    A monitored app (see `client-sdks/`) POSTs its own uncaught
+    error/promise-rejection/React-boundary payload here, in whatever loose
+    shape its runtime handed it (`CrashReport`, app/schemas.py). This route's
+    only job is `crash_report_to_ticket_create()` -- normalizing that into a
+    real `TicketCreate` -- before handing off to the exact same
+    `_run_triage_pipeline` a human-filed ticket goes through. No separate
+    pipeline, no separate persistence path: from this point on, an
+    auto-detected crash and a manually-filed bug report are indistinguishable
+    to the rest of the system.
+    """
+    payload = crash_report_to_ticket_create(report)
+    return await _run_triage_pipeline(payload, request, db)
+
+
+@app.get(
+    "/api/v1/tickets",
+    response_model=list[TicketResponse],
+    tags=["triage"],
+    summary="List triaged tickets, most recent first",
+)
+async def list_tickets(
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[TicketResponse]:
+    """
+    Dashboard-backing endpoint (frontend/): every ticket this instance has
+    triaged, newest first, paginated via `limit`/`offset`. Returns the same
+    `TicketResponse` shape `_run_triage_pipeline` hands back on creation --
+    a dashboard row and a just-submitted result are the same object, so the
+    frontend needs only one renderer for both. Read-only: no filtering
+    beyond pagination, since the frontend's own status/severity filters
+    already operate over whatever page is loaded.
+    """
+    result = await db.execute(
+        select(Ticket).order_by(Ticket.created_at.desc()).limit(limit).offset(offset)
+    )
+    tickets = result.scalars().all()
+    return [_ticket_to_response(ticket) for ticket in tickets]
