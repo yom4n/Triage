@@ -174,6 +174,18 @@ class Settings(BaseSettings):
     # How much of the container's stdout/stderr tail to keep on the ticket
     # (and feed back into the retry prompt). Caps DB row size and prompt cost.
     sandbox_output_tail_chars: int = 4_000
+    # Many real test suites need a database. When the monitored repo has a
+    # docker-compose.yml declaring a `postgres`/`db`/`mysql` service, the
+    # sandbox starts that one service as a sidecar on a private network and
+    # runs the test container alongside it, injecting the connection URL as
+    # an env var (SANDBOX_DB_URL_ENV, default DATABASE_URL). This keeps the
+    # verification faithful to how the repo's own tests expect to run,
+    # without this service needing to understand the repo's schema.
+    sandbox_provision_db: bool = True
+    sandbox_db_url_env: str = "DATABASE_URL"
+    # Extra time allowed just for the DB sidecar to report healthy, on top
+    # of sandbox_timeout_seconds for the test run itself.
+    sandbox_db_startup_seconds: float = 60.0
 
     @property
     def github_owner_repo(self) -> tuple[str, str] | None:
