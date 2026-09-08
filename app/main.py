@@ -9,13 +9,17 @@ the endpoint -- it just POSTs JSON and receives JSON.
 
 Run with:  uvicorn app.main:app --reload
 """
+import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
@@ -362,44 +366,10 @@ def _ticket_to_response(ticket: Ticket, *, similar_tickets_considered: int = 0) 
     )
 
 
-async def _run_triage_pipeline(
-    payload: TicketCreate,
-    request: Request,
-    db: AsyncSession,
-) -> TicketResponse:
-    """
-    End-to-end triage flow, shared by every ingestion route (a human filing
-    a ticket via `POST /api/v1/triage`, or a monitored app's own crash
-    reaching `POST /api/v1/ingest/crash`). Both routes do nothing but
-    produce a valid `TicketCreate` and hand it here -- this function has no
-    idea whether a person or a browser crash hook is the ultimate source,
-    which is exactly the point: the pipeline stays one single code path
-    regardless of how many ingestion adapters feed it.
-
-    1. `payload` has already been validated/sanitized against `TicketCreate`
-       (app/schemas.py) by the time it reaches here.
-    2. The validated fields seed a `TicketState` and run through the
-       compiled LangGraph pipeline (app/graph.py):
-         log_inspector_node  -- LLM extracts the root exception + a clean
-                                 semantic-search query string.
-         rag_lookup_node     -- embeds that query and retrieves verified
-                                 historical tickets via pgvector cosine search.
-         triage_router_node  -- LLM assigns severity/summary/resolution
-                                 steps, grounded in whatever was retrieved.
-       This request's own `db` session is passed into the graph via
-       `config["configurable"]["db_session"]` so retrieval reads share a
-       transaction with the insert below rather than opening a second
-       pooled connection.
-    3. The enriched ticket is persisted to Postgres. It is also embedded
-       and stored (unverified) so it can itself be retrieved by *future*
-       tickets once a human reviews and verifies its resolution -- see the
-       `is_verified` gate in app/services/rag.py.
-    4. A typed `TicketResponse` is returned to the caller.
-    """
-    ticket_id = uuid.uuid4()
-
-    initial_state: TicketState = {
-        "ticket_id": str(ticket_id),
+def _build_initial_state(ticket_id: str, payload: TicketCreate) -> TicketState:
+    """Build the LangGraph input state shared by POST and streaming triage runs."""
+    return {
+        "ticket_id": ticket_id,
         "title": payload.title,
         "stack_trace": payload.stack_trace,
         "environment": payload.environment.value,
@@ -437,47 +407,16 @@ async def _run_triage_pipeline(
         "fix_original_sha": "",
     }
 
-    graph = request.app.state.triage_graph
-    run_config = {
-        "configurable": {
-            # thread_id scopes checkpoint state per-ticket in Redis, so
-            # concurrent triage runs for different tickets never read or
-            # clobber each other's in-progress state.
-            "thread_id": str(ticket_id),
-            # rag_lookup_node reads this straight out of config -- see the
-            # docstring on that node in app/graph.py for why the session
-            # is threaded through here instead of opened inside the node.
-            "db_session": db,
-        }
-    }
 
-    try:
-        # ainvoke is the async entrypoint into the compiled graph -- it
-        # awaits each node in turn (log_inspector -> rag_lookup ->
-        # triage_router), checkpointing state to Redis after every node
-        # completes. LLM failures never reach here: log_inspector_node and
-        # triage_router_node each catch LLMError internally and degrade to
-        # their rule-based fallback (see app/graph.py), and a low- or
-        # zero-confidence result is diverted to fallback_human_escalation_node
-        # by the graph's own conditional routing rather than raising.
-        result_state: TicketState = await graph.ainvoke(initial_state, config=run_config)
-    except SQLAlchemyError:
-        # A genuine DB-layer failure (e.g. rag_lookup_node's pgvector
-        # query hitting a dropped connection) is NOT something a node can
-        # gracefully fall back from -- there is no rule-based substitute
-        # for "the database is unreachable". Re-raise so it's handled by
-        # `database_error_handler` above instead of being flattened into
-        # this function's generic 502, so callers get the correct 503 +
-        # RFC 7807 body and this failure mode is distinguishable from an
-        # LLM/pipeline-logic failure in logs and traces alike.
-        raise
-    except Exception:
-        logger.exception("Triage pipeline failed for ticket %s", ticket_id)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Triage pipeline failed to process this ticket.",
-        )
+async def _persist_triaged_ticket(payload: TicketCreate, result_state: dict, db: AsyncSession) -> Ticket:
+    """
+    Persist a completed triage state to Postgres and return the refreshed row.
 
+    This contains the same storage path used by the non-streaming endpoint:
+    create the ticket row, best-effort embed it for future RAG retrieval,
+    then commit and refresh the ORM object.
+    """
+    ticket_id = uuid.UUID(str(result_state["ticket_id"]))
     ticket_record = Ticket(
         id=ticket_id,
         title=payload.title,
@@ -540,11 +479,233 @@ async def _run_triage_pipeline(
     db.add(ticket_record)
     await db.commit()
     await db.refresh(ticket_record)
+    return ticket_record
+
+
+def _utc_now_iso() -> str:
+    """Return an RFC 3339-ish UTC timestamp for SSE timeline events."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _curated_stream_fields(node_name: str, update: dict[str, Any]) -> dict[str, Any]:
+    """Project a graph node update down to small, browser-safe timeline fields."""
+    if node_name == "log_inspector":
+        return {
+            "extracted_error": update.get("extracted_error"),
+            "affected_file": update.get("affected_file"),
+            "log_inspector_confidence": update.get("log_inspector_confidence"),
+        }
+    if node_name == "rag_lookup":
+        retrieved_context = update.get("retrieved_context") or []
+        similarities = [
+            float(hit.get("similarity", 0.0) or 0.0)
+            for hit in retrieved_context
+            if isinstance(hit, dict)
+        ]
+        return {
+            "retrieved_context_count": len(retrieved_context),
+            "top_similarity": max(similarities, default=0.0),
+        }
+    if node_name == "triage_router":
+        return {
+            "severity": update.get("severity"),
+            "summary": update.get("summary"),
+            "triage_confidence": update.get("triage_confidence"),
+        }
+    if node_name == "fallback_human_escalation":
+        return {
+            "status": update.get("status"),
+            "escalation_reason": update.get("escalation_reason"),
+        }
+    if node_name == "generate_fix":
+        return {
+            "fix_affected_path": update.get("fix_affected_path"),
+            "fix_llm_confidence": update.get("fix_llm_confidence"),
+            "diff_line_count": len((update.get("fix_diff") or "").splitlines()),
+        }
+    if node_name == "verify_fix":
+        return {
+            "fix_verification_status": update.get("fix_verification_status"),
+            "fix_verification_attempts": update.get("fix_verification_attempts"),
+            "fix_test_command": update.get("fix_test_command"),
+        }
+    if node_name == "open_pr":
+        return {"fix_pr_url": update.get("fix_pr_url")}
+    if node_name == "fix_escalation":
+        return {"fix_skipped_reason": update.get("fix_skipped_reason")}
+    return {"keys": sorted(list(update.keys()))}
+
+
+def _sse_data(payload: dict[str, Any]) -> str:
+    """Encode one Server-Sent Event data frame."""
+    return f"data: {json.dumps(payload)}\n\n"
+
+async def _run_triage_pipeline(
+    payload: TicketCreate,
+    request: Request,
+    db: AsyncSession,
+) -> TicketResponse:
+    """
+    End-to-end triage flow, shared by every ingestion route (a human filing
+    a ticket via `POST /api/v1/triage`, or a monitored app's own crash
+    reaching `POST /api/v1/ingest/crash`). Both routes do nothing but
+    produce a valid `TicketCreate` and hand it here -- this function has no
+    idea whether a person or a browser crash hook is the ultimate source,
+    which is exactly the point: the pipeline stays one single code path
+    regardless of how many ingestion adapters feed it.
+
+    1. `payload` has already been validated/sanitized against `TicketCreate`
+       (app/schemas.py) by the time it reaches here.
+    2. The validated fields seed a `TicketState` and run through the
+       compiled LangGraph pipeline (app/graph.py):
+         log_inspector_node  -- LLM extracts the root exception + a clean
+                                 semantic-search query string.
+         rag_lookup_node     -- embeds that query and retrieves verified
+                                 historical tickets via pgvector cosine search.
+         triage_router_node  -- LLM assigns severity/summary/resolution
+                                 steps, grounded in whatever was retrieved.
+       This request's own `db` session is passed into the graph via
+       `config["configurable"]["db_session"]` so retrieval reads share a
+       transaction with the insert below rather than opening a second
+       pooled connection.
+    3. The enriched ticket is persisted to Postgres. It is also embedded
+       and stored (unverified) so it can itself be retrieved by *future*
+       tickets once a human reviews and verifies its resolution -- see the
+       `is_verified` gate in app/services/rag.py.
+    4. A typed `TicketResponse` is returned to the caller.
+    """
+    ticket_id = uuid.uuid4()
+    initial_state = _build_initial_state(str(ticket_id), payload)
+
+    graph = request.app.state.triage_graph
+    run_config = {
+        "configurable": {
+            # thread_id scopes checkpoint state per-ticket in Redis, so
+            # concurrent triage runs for different tickets never read or
+            # clobber each other's in-progress state.
+            "thread_id": str(ticket_id),
+            # rag_lookup_node reads this straight out of config -- see the
+            # docstring on that node in app/graph.py for why the session
+            # is threaded through here instead of opened inside the node.
+            "db_session": db,
+        }
+    }
+
+    try:
+        # ainvoke is the async entrypoint into the compiled graph -- it
+        # awaits each node in turn (log_inspector -> rag_lookup ->
+        # triage_router), checkpointing state to Redis after every node
+        # completes. LLM failures never reach here: log_inspector_node and
+        # triage_router_node each catch LLMError internally and degrade to
+        # their rule-based fallback (see app/graph.py), and a low- or
+        # zero-confidence result is diverted to fallback_human_escalation_node
+        # by the graph's own conditional routing rather than raising.
+        result_state: TicketState = await graph.ainvoke(initial_state, config=run_config)
+    except SQLAlchemyError:
+        # A genuine DB-layer failure (e.g. rag_lookup_node's pgvector
+        # query hitting a dropped connection) is NOT something a node can
+        # gracefully fall back from -- there is no rule-based substitute
+        # for "the database is unreachable". Re-raise so it's handled by
+        # `database_error_handler` above instead of being flattened into
+        # this function's generic 502, so callers get the correct 503 +
+        # RFC 7807 body and this failure mode is distinguishable from an
+        # LLM/pipeline-logic failure in logs and traces alike.
+        raise
+    except Exception:
+        logger.exception("Triage pipeline failed for ticket %s", ticket_id)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Triage pipeline failed to process this ticket.",
+        )
+
+    ticket_record = await _persist_triaged_ticket(payload, result_state, db)
 
     return _ticket_to_response(
         ticket_record, similar_tickets_considered=len(result_state.get("retrieved_context", []))
     )
 
+
+@app.get(
+    "/api/v1/triage/stream",
+    tags=["triage"],
+    summary="Stream a triage run as Server-Sent Events, one event per pipeline node",
+)
+async def stream_triage(
+    request: Request,
+    title: str = Query(...),
+    stack_trace: str = Query(...),
+    environment: EnvironmentEnum = Query(...),
+    description: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Run the triage graph and stream one SSE event per completed node."""
+    try:
+        payload = TicketCreate(
+            title=title,
+            stack_trace=stack_trace,
+            environment=environment,
+            description=description,
+        )
+    except PydanticValidationError as exc:
+        return _problem_response(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            title="Invalid Triage Request",
+            detail=str(exc),
+            type_slug="validation-error",
+            request=request,
+        )
+
+    ticket_id = str(uuid.uuid4())
+    initial_state = _build_initial_state(ticket_id, payload)
+    graph = request.app.state.triage_graph
+    run_config = {
+        "configurable": {
+            "thread_id": ticket_id,
+            "db_session": db,
+        }
+    }
+
+    async def event_generator():
+        result_state: dict = dict(initial_state)
+        last_event_at = time.perf_counter()
+        try:
+            async for chunk in graph.astream(initial_state, config=run_config, stream_mode="updates"):
+                now = time.perf_counter()
+                duration_ms = round((now - last_event_at) * 1000, 2)
+                last_event_at = now
+
+                for node_name, update in chunk.items():
+                    update_dict = update if isinstance(update, dict) else {}
+                    result_state.update(update_dict)
+                    yield _sse_data(
+                        {
+                            "node": node_name,
+                            "ts": _utc_now_iso(),
+                            "duration_ms": duration_ms,
+                            "fields": _curated_stream_fields(node_name, update_dict),
+                        }
+                    )
+
+            ticket_record = await _persist_triaged_ticket(payload, result_state, db)
+            yield _sse_data(
+                {
+                    "event": "done",
+                    "ticket_id": str(ticket_record.id),
+                    "status": result_state["status"],
+                }
+            )
+        except Exception as exc:
+            logger.exception("Streaming triage failed for ticket %s", ticket_id)
+            yield _sse_data({"event": "error", "detail": str(exc)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 @app.post(
     "/api/v1/triage",

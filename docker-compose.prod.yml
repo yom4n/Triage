@@ -1,0 +1,64 @@
+# For this compose file, POSTGRES_HOST in .env must be set to "postgres",
+# not localhost, because the backend reaches the database by service name.
+
+services:
+  backend:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_SOCKET_GID:-0}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - triage_prod_net
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-triage_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-triage_password}
+      POSTGRES_DB: ${POSTGRES_DB:-triage_engine}
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-triage_user} -d ${POSTGRES_DB:-triage_engine}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - triage_prod_net
+
+  redis:
+    image: redis:alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - triage_prod_net
+
+volumes:
+  postgres_prod_data:
+  redis_prod_data:
+
+networks:
+  triage_prod_net:
+    driver: bridge
