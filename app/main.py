@@ -11,7 +11,6 @@ Run with:  uvicorn app.main:app --reload
 """
 import json
 import logging
-import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -493,24 +492,29 @@ def _curated_stream_fields(node_name: str, update: dict[str, Any]) -> dict[str, 
         return {
             "extracted_error": update.get("extracted_error"),
             "affected_file": update.get("affected_file"),
-            "log_inspector_confidence": update.get("log_inspector_confidence"),
+            "affected_line": update.get("affected_line"),
+            "confidence": update.get("log_inspector_confidence"),
+            "used_llm": update.get("used_llm_log_inspector"),
         }
     if node_name == "rag_lookup":
         retrieved_context = update.get("retrieved_context") or []
-        similarities = [
-            float(hit.get("similarity", 0.0) or 0.0)
-            for hit in retrieved_context
-            if isinstance(hit, dict)
-        ]
         return {
-            "retrieved_context_count": len(retrieved_context),
-            "top_similarity": max(similarities, default=0.0),
+            "hits": len(retrieved_context),
+            "top_similarity": max(
+                (
+                    hit.get("similarity", 0.0)
+                    for hit in retrieved_context
+                    if isinstance(hit, dict)
+                ),
+                default=0.0,
+            ),
         }
     if node_name == "triage_router":
         return {
             "severity": update.get("severity"),
             "summary": update.get("summary"),
-            "triage_confidence": update.get("triage_confidence"),
+            "confidence": update.get("triage_confidence"),
+            "used_llm": update.get("used_llm_triage_router"),
         }
     if node_name == "fallback_human_escalation":
         return {
@@ -519,22 +523,31 @@ def _curated_stream_fields(node_name: str, update: dict[str, Any]) -> dict[str, 
         }
     if node_name == "generate_fix":
         return {
-            "fix_affected_path": update.get("fix_affected_path"),
-            "fix_llm_confidence": update.get("fix_llm_confidence"),
-            "diff_line_count": len((update.get("fix_diff") or "").splitlines()),
+            "affected_path": update.get("fix_affected_path"),
+            "llm_confidence": update.get("fix_llm_confidence"),
+            "diff_lines": len((update.get("fix_diff") or "").splitlines()),
+            "skipped_reason": update.get("fix_skipped_reason") or None,
+            "attempt": update.get("fix_verification_attempts"),
         }
     if node_name == "verify_fix":
         return {
-            "fix_verification_status": update.get("fix_verification_status"),
-            "fix_verification_attempts": update.get("fix_verification_attempts"),
-            "fix_test_command": update.get("fix_test_command"),
+            "status": update.get("fix_verification_status"),
+            "attempts": update.get("fix_verification_attempts"),
+            "test_command": update.get("fix_test_command"),
+            "verified": update.get("fix_verified"),
         }
     if node_name == "open_pr":
-        return {"fix_pr_url": update.get("fix_pr_url")}
+        return {
+            "pr_url": update.get("fix_pr_url"),
+            "branch": update.get("fix_branch_name"),
+            "skipped_reason": update.get("fix_skipped_reason") or None,
+        }
     if node_name == "fix_escalation":
-        return {"fix_skipped_reason": update.get("fix_skipped_reason")}
+        return {
+            "status": update.get("fix_verification_status"),
+            "skipped_reason": update.get("fix_skipped_reason"),
+        }
     return {"keys": sorted(list(update.keys()))}
-
 
 def _sse_data(payload: dict[str, Any]) -> str:
     """Encode one Server-Sent Event data frame."""
@@ -666,22 +679,19 @@ async def stream_triage(
     }
 
     async def event_generator():
+        seq = 0
         result_state: dict = dict(initial_state)
-        last_event_at = time.perf_counter()
         try:
             async for chunk in graph.astream(initial_state, config=run_config, stream_mode="updates"):
-                now = time.perf_counter()
-                duration_ms = round((now - last_event_at) * 1000, 2)
-                last_event_at = now
-
                 for node_name, update in chunk.items():
                     update_dict = update if isinstance(update, dict) else {}
+                    seq += 1
                     result_state.update(update_dict)
                     yield _sse_data(
                         {
                             "node": node_name,
                             "ts": _utc_now_iso(),
-                            "duration_ms": duration_ms,
+                            "seq": seq,
                             "fields": _curated_stream_fields(node_name, update_dict),
                         }
                     )
@@ -692,6 +702,7 @@ async def stream_triage(
                     "event": "done",
                     "ticket_id": str(ticket_record.id),
                     "status": result_state["status"],
+                    "fix_pr_url": result_state.get("fix_pr_url") or None,
                 }
             )
         except Exception as exc:
@@ -703,6 +714,7 @@ async def stream_triage(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )

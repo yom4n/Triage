@@ -1,17 +1,12 @@
-# For this compose file, POSTGRES_HOST in .env must be set to "postgres",
-# not localhost, because the backend reaches the database by service name.
-
+# For this compose file, POSTGRES_HOST in .env must be set to postgres, not localhost.
 services:
   backend:
     build: .
-    env_file:
-      - .env
+    env_file: .env
     ports:
       - "8000:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    group_add:
-      - "${DOCKER_SOCKET_GID:-0}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -19,7 +14,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     networks:
-      - triage_prod_net
+      - triage_net
 
   postgres:
     image: pgvector/pgvector:pg16
@@ -28,8 +23,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-triage_password}
       POSTGRES_DB: ${POSTGRES_DB:-triage_engine}
     volumes:
-      - postgres_prod_data:/var/lib/postgresql/data
-      - ./init-db:/docker-entrypoint-initdb.d:ro
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-triage_user} -d ${POSTGRES_DB:-triage_engine}"]
       interval: 5s
@@ -38,13 +32,13 @@ services:
       start_period: 10s
     restart: unless-stopped
     networks:
-      - triage_prod_net
+      - triage_net
 
   redis:
     image: redis:alpine
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
-      - redis_prod_data:/data
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -53,12 +47,12 @@ services:
       start_period: 5s
     restart: unless-stopped
     networks:
-      - triage_prod_net
+      - triage_net
 
 volumes:
-  postgres_prod_data:
-  redis_prod_data:
+  postgres_data:
+  redis_data:
 
 networks:
-  triage_prod_net:
+  triage_net:
     driver: bridge

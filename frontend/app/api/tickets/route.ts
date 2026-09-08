@@ -10,32 +10,32 @@ export async function GET(request: NextRequest) {
   const search = request.nextUrl.search;
 
   try {
-    const response = await fetch(`${backendBaseUrl()}/api/v1/triage/stream${search}`, {
+    const response = await fetch(`${backendBaseUrl()}/api/v1/tickets${search}`, {
       method: "GET",
       headers: {
-        Accept: "text/event-stream"
+        Accept: "application/json, application/problem+json"
       },
       cache: "no-store"
     });
 
-    if (!response.body) {
-      return NextResponse.json(
-        {
-          title: "Backend Stream Empty",
-          detail: "The FastAPI backend returned an empty stream response.",
-          status: 502,
-          trace_id: "unavailable"
-        },
-        { status: 502 }
-      );
+    const text = await response.text();
+    const contentType = response.headers.get("content-type") ?? "";
+    let body: unknown = text ? { detail: text } : {};
+
+    if (contentType.includes("json") && text) {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = { detail: text };
+      }
     }
 
-    return new Response(response.body, {
+    return NextResponse.json(body, {
       status: response.status,
       headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive"
+        "Content-Type": contentType.includes("problem+json")
+          ? "application/problem+json"
+          : "application/json"
       }
     });
   } catch {

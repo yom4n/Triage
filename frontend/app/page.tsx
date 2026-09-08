@@ -15,6 +15,7 @@ import {
   ShieldAlert
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import AgentRun from "./components/AgentRun";
 import type {
   Environment,
   IncidentRecord,
@@ -23,8 +24,7 @@ import type {
   TriagePayload,
   TriageResponse,
   TriageStatus
-} from "../types/triage";
-import AgentRun from "./components/AgentRun";
+} from "./types/triage";
 
 const sampleTrace = `Traceback (most recent call last):
   File "checkout.py", line 91, in charge_card
@@ -53,10 +53,9 @@ const severityLabels: Record<Severity, string> = {
 
 type HealthState = "checking" | "online" | "offline";
 type FilterState = "ALL" | TriageStatus;
-type AppTab = "live" | "dashboard";
+type ActiveTab = "live" | "dashboard";
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<AppTab>("live");
   const [form, setForm] = useState<TriagePayload>(emptyPayload);
   const [incidents, setIncidents] = useState<IncidentRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -66,6 +65,7 @@ export default function Home() {
   const [error, setError] = useState<ProblemResponse | null>(null);
   const [isLoadingTickets, setIsLoadingTickets] = useState(false);
   const [ticketsError, setTicketsError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<ActiveTab>("live");
 
   useEffect(() => {
     checkHealth();
@@ -225,11 +225,12 @@ export default function Home() {
           </button>
         </div>
       </header>
-
-      <div className="view-tabs segment-control" aria-label="Workspace view">
+      <div className="view-tabs" role="tablist" aria-label="Primary view">
         <button
           className={activeTab === "live" ? "active" : ""}
           type="button"
+          role="tab"
+          aria-selected={activeTab === "live"}
           onClick={() => setActiveTab("live")}
         >
           Live Run
@@ -237,6 +238,8 @@ export default function Home() {
         <button
           className={activeTab === "dashboard" ? "active" : ""}
           type="button"
+          role="tab"
+          aria-selected={activeTab === "dashboard"}
           onClick={() => setActiveTab("dashboard")}
         >
           Dashboard
@@ -244,7 +247,7 @@ export default function Home() {
       </div>
 
       {activeTab === "live" ? (
-        <section className="workspace live-workspace">
+        <section className="live-run-shell">
           <AgentRun />
         </section>
       ) : (
