@@ -277,6 +277,8 @@ def drill_d_unverifiable_fix(client: TestClient) -> None:
     assert body.get("fix_diff"), "the failed fix's diff must still be attached for a human to take over"
     assert sandbox_calls["n"] >= 2, f"expected the generate->verify loop to retry, sandbox ran {sandbox_calls['n']}x"
     assert generate_calls["n"] == sandbox_calls["n"], "each retry should re-generate the fix"
+    assert body["fix_verification_status"] in ("FAILED_MAX_ATTEMPTS", "SKIPPED_UNTESTABLE"), body
+    assert body["fix_verification_status"] != "NOT_ATTEMPTED", body
     logger.info(
         "Drill D PASSED: fix failed sandbox %dx (max_attempts) -> escalated with diff, no PR opened",
         sandbox_calls["n"],

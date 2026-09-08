@@ -222,6 +222,8 @@ Given a raw stack trace or log excerpt, identify:
 2. The file and line most directly implicated, ONLY if the trace actually names one -- never invent a file/line that isn't present.
 3. A short, clean natural-language sentence describing the failure, suitable for semantic search against a database of past tickets (no file paths, line numbers, or timestamps).
 
+Ignore stack frames inside node_modules/, site-packages/, dist/, .venv/, or other dependency/vendor directories when choosing affected_file -- pick the deepest frame in first-party application source (e.g. src/, app/, services/, lib/). If the trace text or context explicitly names a config/source file, prefer that.
+
 Be conservative with confidence: only report confidence above 0.85 when the root cause is unambiguous from the text given."""
 
 
@@ -259,13 +261,32 @@ def _fallback_extract_error(trace: str) -> str:
 _FILE_LINE_PATTERN = re.compile(r"\(([^\s()]+):(\d+):\d+\)|(?:^|\s)at\s+([^\s()]+):(\d+):\d+")
 
 
+def _is_vendor_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").lower()
+    parts = [part for part in normalized.split("/") if part]
+    return (
+        "node_modules" in parts
+        or "site-packages" in parts
+        or ".venv" in parts
+        or "venv" in parts
+        or "dist" in parts
+    )
+
+
 def _fallback_extract_file_line(trace: str) -> tuple[str | None, int | None]:
-    match = _FILE_LINE_PATTERN.search(trace)
-    if not match:
-        return None, None
-    file_path = match.group(1) or match.group(3)
-    line_str = match.group(2) or match.group(4)
-    return file_path, int(line_str)
+    first_vendor_match: tuple[str, int] | None = None
+    for match in _FILE_LINE_PATTERN.finditer(trace):
+        file_path = match.group(1) or match.group(3)
+        line_str = match.group(2) or match.group(4)
+        result = (file_path, int(line_str))
+        if _is_vendor_path(file_path):
+            if first_vendor_match is None:
+                first_vendor_match = result
+            continue
+        return result
+    if first_vendor_match:
+        return first_vendor_match
+    return None, None
 
 
 @traced_node("log_inspector")
@@ -1086,7 +1107,9 @@ async def fix_escalation_node(state: TicketState) -> dict:
     ticket so a human picks up exactly where the agent stopped, rather than
     from nothing. No PR is opened.
     """
-    status = state.get("fix_verification_status", "SKIPPED_UNTESTABLE")
+    status = state.get("fix_verification_status")
+    if not status or status == "NOT_ATTEMPTED":
+        status = "SKIPPED_UNTESTABLE"
     if status == "FAILED_MAX_ATTEMPTS":
         reason = (
             f"A fix was generated and tested in a sandbox {state.get('fix_verification_attempts', 0)} "
@@ -1101,6 +1124,7 @@ async def fix_escalation_node(state: TicketState) -> dict:
         )
     logger.info("fix_escalation_node: ticket %s -- %s", state["ticket_id"], status)
     return {
+        "fix_verification_status": status,
         "fix_skipped_reason": reason,
         "fix_pr_url": "",
         "fix_branch_name": "",
