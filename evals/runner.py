@@ -231,9 +231,13 @@ def run_scored(cases: list[EvalCase], offline: bool) -> dict[str, Any]:
 
     import app.graph as graph_module
     from app.main import app
+    from app.services.llm import LLMError
 
     async def _offline_llm_failure(**kwargs):
-        raise RuntimeError("offline eval forced rule-based fallback")
+        # Must be an LLMError: log_inspector_node / triage_router_node only
+        # catch LLMError to trigger their rule-based fallback -- any other
+        # exception propagates out as a 502 instead of degrading gracefully.
+        raise LLMError("offline eval forced rule-based fallback")
 
     patcher = patch.object(graph_module, "call_structured", new=AsyncMock(side_effect=_offline_llm_failure))
     context = patcher if offline else _NullContext()
@@ -248,15 +252,21 @@ def run_scored(cases: list[EvalCase], offline: bool) -> dict[str, Any]:
                             "id": case.id,
                             "title": case.title,
                             "http_status": response.status_code,
-                            "error": response.text,
+                            "error": response.text[:2000],
                             "root_cause_hit": False,
+                            "matched_keywords": [],
+                            "expected_keywords": case.root_cause_keywords,
+                            "severity_expected": case.severity,
+                            "severity_actual": None,
                             "severity_match": False,
                             "escalation_correct": False,
                             "should_escalate_expected": case.should_escalate,
                             "should_escalate_actual": False,
+                            "status": None,
                             "fix_attempted": False,
                             "fix_verification_status": "NOT_ATTEMPTED",
                             "fix_verification_attempts": 0,
+                            "fix_verified": False,
                         }
                     )
                     continue

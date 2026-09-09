@@ -1,0 +1,456 @@
+{
+  "aggregate": {
+    "case_count": 16,
+    "escalation": {
+      "expected": 4,
+      "f1": 0.4,
+      "precision": 0.25,
+      "predicted": 16,
+      "recall": 1.0,
+      "true_positives": 4
+    },
+    "fix_attempted_count": 0,
+    "fix_verification_passed_count": 0,
+    "fix_verification_rate": 0.0,
+    "mean_fix_verification_attempts_over_passed": 0.0,
+    "root_cause_hit_rate": 0.875,
+    "severity_accuracy": 0.5
+  },
+  "available": true,
+  "cases": [
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "cache",
+        "redis",
+        "stampede",
+        "timeout"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "cache_stampede",
+      "matched_keywords": [
+        "cache",
+        "timeout"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "CRITICAL",
+      "severity_expected": "HIGH",
+      "severity_match": false,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Catalog slows after cache expiry"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "CORS",
+        "origin",
+        "allow",
+        "configuration"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "cors_config",
+      "matched_keywords": [
+        "CORS",
+        "origin",
+        "allow"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "MEDIUM",
+      "severity_match": false,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Browser blocks admin API calls from new domain"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "pool",
+        "connection",
+        "exhausted",
+        "timeout"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "db_pool_exhaustion",
+      "matched_keywords": [
+        "pool",
+        "timeout"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "CRITICAL",
+      "severity_expected": "CRITICAL",
+      "severity_match": true,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Checkout API exhausts Postgres pool under load"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "timeout",
+        "payment",
+        "dependency",
+        "ReadTimeout"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "dependency_timeout",
+      "matched_keywords": [
+        "timeout",
+        "payment",
+        "ReadTimeout"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "CRITICAL",
+      "severity_expected": "CRITICAL",
+      "severity_match": true,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Payment provider timeout blocks checkout"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "disk",
+        "space",
+        "device",
+        "tmp"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "disk_full",
+      "matched_keywords": [],
+      "root_cause_hit": false,
+      "severity_actual": "HIGH",
+      "severity_expected": "HIGH",
+      "severity_match": true,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Upload service cannot write temporary files"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "jwt",
+        "expired",
+        "token",
+        "Signature"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "jwt_expiry",
+      "matched_keywords": [
+        "expired",
+        "Signature"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "HIGH",
+      "severity_match": true,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Mobile clients receive unauthorized responses"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "migration",
+        "column",
+        "does not exist",
+        "fulfillment_state"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "migration_error",
+      "matched_keywords": [
+        "migration"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "CRITICAL",
+      "severity_match": false,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "API errors after orders migration"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "environment",
+        "variable",
+        "STRIPE_WEBHOOK_SECRET",
+        "config"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "missing_env_var",
+      "matched_keywords": [
+        "environment",
+        "config"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "HIGH",
+      "severity_match": true,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Worker cannot boot after config rename"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "undefined",
+        "null",
+        "timezone",
+        "settings"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "null_deref",
+      "matched_keywords": [
+        "settings"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "HIGH",
+      "severity_match": true,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Profile page crashes on missing user settings"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "memory",
+        "OOM",
+        "allocate",
+        "code 137"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "oom",
+      "matched_keywords": [
+        "memory"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "HIGH",
+      "severity_match": true,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Report exporter killed by memory limit"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "race",
+        "concurrent",
+        "duplicate",
+        "unique"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "race_condition",
+      "matched_keywords": [
+        "concurrent",
+        "duplicate"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "HIGH",
+      "severity_match": true,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Duplicate invoice numbers generated concurrently"
+    },
+    {
+      "escalation_correct": false,
+      "expected_keywords": [
+        "rate",
+        "limit",
+        "429",
+        "Retry-After"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "rate_limit",
+      "matched_keywords": [],
+      "root_cause_hit": false,
+      "severity_actual": "LOW",
+      "severity_expected": "MEDIUM",
+      "severity_match": false,
+      "should_escalate_actual": true,
+      "should_escalate_expected": false,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Search indexing jobs rejected by vendor"
+    },
+    {
+      "escalation_correct": true,
+      "expected_keywords": [
+        "react",
+        "minified",
+        "blank",
+        "dashboard"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "vague_blank_screen",
+      "matched_keywords": [
+        "react",
+        "minified",
+        "blank",
+        "dashboard"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "MEDIUM",
+      "severity_match": false,
+      "should_escalate_actual": true,
+      "should_escalate_expected": true,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Dashboard shows blank screen"
+    },
+    {
+      "escalation_correct": true,
+      "expected_keywords": [
+        "intermittent",
+        "unknown",
+        "UNCLASSIFIED",
+        "failed"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "vague_intermittent",
+      "matched_keywords": [
+        "intermittent",
+        "unknown",
+        "UNCLASSIFIED",
+        "failed"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "LOW",
+      "severity_match": false,
+      "should_escalate_actual": true,
+      "should_escalate_expected": true,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Intermittent failures reported by customer"
+    },
+    {
+      "escalation_correct": true,
+      "expected_keywords": [
+        "unknown",
+        "symbolication",
+        "mobile",
+        "crash"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "vague_mobile_crash",
+      "matched_keywords": [
+        "unknown",
+        "symbolication",
+        "mobile",
+        "crash"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "MEDIUM",
+      "severity_match": false,
+      "should_escalate_actual": true,
+      "should_escalate_expected": true,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Mobile app occasionally closes"
+    },
+    {
+      "escalation_correct": true,
+      "expected_keywords": [
+        "slow",
+        "latency",
+        "baseline",
+        "unknown"
+      ],
+      "fix_attempted": false,
+      "fix_verification_attempts": 0,
+      "fix_verification_status": "NOT_ATTEMPTED",
+      "fix_verified": false,
+      "http_status": 201,
+      "id": "vague_slow",
+      "matched_keywords": [
+        "slow",
+        "baseline",
+        "unknown"
+      ],
+      "root_cause_hit": true,
+      "severity_actual": "HIGH",
+      "severity_expected": "LOW",
+      "severity_match": false,
+      "should_escalate_actual": true,
+      "should_escalate_expected": true,
+      "status": "ESCALATED_TO_HUMAN",
+      "title": "Application feels slow"
+    }
+  ],
+  "generated_at": "2026-09-09T23:11:50.310288+00:00",
+  "mode": "offline"
+}
