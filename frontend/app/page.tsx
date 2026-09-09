@@ -23,7 +23,8 @@ import type {
   Severity,
   TriagePayload,
   TriageResponse,
-  TriageStatus
+  TriageStatus,
+  TicketSource
 } from "./types/triage";
 
 const sampleTrace = `Traceback (most recent call last):
@@ -54,6 +55,13 @@ const severityLabels: Record<Severity, string> = {
 type HealthState = "checking" | "online" | "offline";
 type FilterState = "ALL" | TriageStatus;
 type ActiveTab = "live" | "dashboard";
+type DetectorRuleStatus = {
+  name: string;
+  last_value: number | null;
+  firing: boolean;
+  last_ticket_id: string | null;
+};
+type DetectorStatus = { enabled: boolean; rules: DetectorRuleStatus[] };
 
 export default function Home() {
   const [form, setForm] = useState<TriagePayload>(emptyPayload);
@@ -66,10 +74,12 @@ export default function Home() {
   const [isLoadingTickets, setIsLoadingTickets] = useState(false);
   const [ticketsError, setTicketsError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>("live");
+  const [detectorStatus, setDetectorStatus] = useState<DetectorStatus | null>(null);
 
   useEffect(() => {
     checkHealth();
     loadTickets();
+    loadDetectorStatus();
   }, []);
 
   async function loadTickets() {
@@ -132,6 +142,17 @@ export default function Home() {
       setHealth(response.ok ? "online" : "offline");
     } catch {
       setHealth("offline");
+    }
+  }
+
+  async function loadDetectorStatus() {
+    try {
+      const response = await fetch("/api/detector/status", { cache: "no-store" });
+      if (response.ok) {
+        setDetectorStatus((await response.json()) as DetectorStatus);
+      }
+    } catch {
+      setDetectorStatus(null);
     }
   }
 
@@ -275,6 +296,7 @@ export default function Home() {
               onFilterChange={setFilter}
               onSelect={setSelectedId}
               onRefresh={loadTickets}
+              detectorStatus={detectorStatus}
             />
 
             <TicketDetail incident={selectedIncident} gitDiff={selectedIncident?.git_diff} />
@@ -403,7 +425,8 @@ function Dashboard({
   loadError,
   onFilterChange,
   onSelect,
-  onRefresh
+  onRefresh,
+  detectorStatus
 }: {
   incidents: IncidentRecord[];
   allCount: number;
@@ -420,6 +443,7 @@ function Dashboard({
   onFilterChange: (filter: FilterState) => void;
   onSelect: (id: string) => void;
   onRefresh: () => void;
+  detectorStatus: DetectorStatus | null;
 }) {
   return (
     <section className="panel dashboard-panel">
@@ -442,6 +466,8 @@ function Dashboard({
           </div>
         </div>
       ) : null}
+
+      <DetectorStrip status={detectorStatus} />
 
       <div className="stats-grid">
         <Stat icon={<ClipboardList size={18} />} label="Total" value={stats.total.toString()} />
@@ -490,7 +516,10 @@ function Dashboard({
               >
                 <span className="ticket-cell">
                   <strong>{incident.response.title}</strong>
-                  <small>{formatDate(incident.response.created_at)}</small>
+                  <small>
+                    {formatDate(incident.response.created_at)}
+                    <SourceBadge source={incident.response.source} />
+                  </small>
                 </span>
                 <StatusBadge status={incident.response.status} />
                 <SeverityBadge severity={incident.response.severity} />
@@ -532,6 +561,7 @@ function TicketDetail({
           <div className="detail-meta">
             <StatusBadge status={response.status} />
             <SeverityBadge severity={response.severity} />
+            <SourceBadge source={response.source} />
             <span>{response.environment}</span>
           </div>
           <h2>{response.title}</h2>
@@ -633,6 +663,28 @@ function StatusBadge({ status }: { status: TriageStatus }) {
 
 function SeverityBadge({ severity }: { severity: Severity }) {
   return <span className={`badge severity-${severity.toLowerCase()}`}>{severityLabels[severity]}</span>;
+}
+
+function SourceBadge({ source }: { source: TicketSource }) {
+  if (source === "human") {
+    return null;
+  }
+  return <span className="badge source-badge">Auto: {source}</span>;
+}
+
+function DetectorStrip({ status }: { status: DetectorStatus | null }) {
+  if (!status) {
+    return null;
+  }
+  const firing = status.rules.filter((rule) => rule.firing).length;
+  return (
+    <div className="detector-strip">
+      <Activity size={16} />
+      <span>Detector {status.enabled ? "enabled" : "disabled"}</span>
+      <strong>{firing} firing</strong>
+      <span>{status.rules.length} rules</span>
+    </div>
+  );
 }
 
 function compactPayload(payload: TriagePayload): TriagePayload {

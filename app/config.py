@@ -109,6 +109,15 @@ class Settings(BaseSettings):
     def cors_allow_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]
 
+    # -- Proactive metric detector ------------------------------------------
+    detector_enabled: bool = False
+    prometheus_base_url: str = "http://localhost:9090"
+    detector_poll_seconds: float = 15.0
+    detector_rule_cooldown_seconds: float = 900.0
+    detector_error_rate_threshold: float = 5.0
+    detector_p95_latency_threshold_seconds: float = 1.5
+    detector_dependency_down_threshold: float = 0.0
+
     # -- GitHub auto-fix (Phase 4b: propose_fix_node) ------------------------
     # `github_token` is optional by design: propose_fix_node checks for it
     # and no-ops (skips the fix attempt, ticket still completes normally)

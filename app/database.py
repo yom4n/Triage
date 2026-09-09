@@ -113,6 +113,7 @@ _ADDITIVE_COLUMN_DDL = [
     "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS fix_verification_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS fix_test_command VARCHAR(300)",
     "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS fix_test_output_tail TEXT",
+    "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'human'",
 ]
 
 

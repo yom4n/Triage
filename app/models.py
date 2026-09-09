@@ -51,6 +51,9 @@ class Ticket(Base):
     stack_trace: Mapped[str] = mapped_column(Text, nullable=False)
     environment: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="human", server_default="human", index=True
+    )
 
     # -- Written by log_inspector_node --------------------------------------
     extracted_error: Mapped[str] = mapped_column(String(200), nullable=False, index=True)

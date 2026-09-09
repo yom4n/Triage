@@ -168,6 +168,21 @@ class CrashReport(BaseModel):
     )
 
 
+class MetricAlert(BaseModel):
+    """Loose Prometheus alert payload accepted by metric ingestion and detector."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
+
+    rule_name: str = Field(..., min_length=1, max_length=200)
+    expr: str = Field(..., min_length=1, max_length=2000)
+    value: float
+    threshold: float
+    severity_hint: str | None = Field(default=None, max_length=50)
+    description: str | None = Field(default=None, max_length=2000)
+    labels: dict[str, str] = Field(default_factory=dict)
+    environment: EnvironmentEnum = EnvironmentEnum.PRODUCTION
+
+
 def crash_report_to_ticket_create(report: CrashReport) -> TicketCreate:
     """
     Normalize a loose, runtime-provided `CrashReport` into a valid
@@ -214,6 +229,32 @@ def crash_report_to_ticket_create(report: CrashReport) -> TicketCreate:
     )
 
 
+def metric_alert_to_ticket_create(alert: MetricAlert) -> TicketCreate:
+    """Normalize a Prometheus threshold breach into a guardrail-clearing ticket."""
+    severity = f" ({alert.severity_hint})" if alert.severity_hint else ""
+    title = f"Metric alert: {alert.rule_name}{severity}"[:200]
+    label_text = ", ".join(f"{key}={value}" for key, value in sorted(alert.labels.items())) or "none"
+    description = alert.description or (
+        f"Prometheus rule {alert.rule_name} breached threshold {alert.threshold} with value {alert.value}."
+    )
+    stack_trace = (
+        "Prometheus metric threshold breach\n"
+        f"rule_name: {alert.rule_name}\n"
+        f"expr: {alert.expr}\n"
+        f"value: {alert.value}\n"
+        f"threshold: {alert.threshold}\n"
+        f"severity_hint: {alert.severity_hint or 'unspecified'}\n"
+        f"labels: {label_text}\n"
+        f"description: {description}"
+    )[:8000]
+    return TicketCreate(
+        title=title,
+        stack_trace=stack_trace,
+        environment=alert.environment,
+        description=description[:2000],
+    )
+
+
 class TicketResponse(BaseModel):
     """Structured triage result returned to the calling system."""
 
@@ -225,6 +266,7 @@ class TicketResponse(BaseModel):
     ticket_id: uuid.UUID
     title: str
     environment: EnvironmentEnum
+    source: str = "human"
     # Round-tripped so a dashboard fetching this via GET /api/v1/tickets can
     # render the original trace without a second request -- POST callers
     # already have it (they sent it), but a list/detail view reading a

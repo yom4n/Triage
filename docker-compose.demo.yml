@@ -1,0 +1,14 @@
+services:
+  demo-app:
+    build: ./demo-app
+    ports:
+      - "8081:8081"
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - demo-app

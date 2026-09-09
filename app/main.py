@@ -31,12 +31,15 @@ from app.graph import TicketState, build_triage_graph
 from app.schemas import (
     CrashReport,
     EnvironmentEnum,
+    MetricAlert,
     SeverityEnum,
     TicketCreate,
     TicketResponse,
     TriageStatusEnum,
     crash_report_to_ticket_create,
+    metric_alert_to_ticket_create,
 )
+from app.services.detector import DetectorService
 from app.services.embeddings import EmbeddingError, build_embedding_text, generate_embedding, warn_if_deterministic
 from app.services.llm import LLMError, LLMMalformedOutputError, LLMTimeoutError
 from app.services.telemetry import current_trace_id, instrument_fastapi_app, setup_telemetry, shutdown_telemetry
@@ -146,6 +149,8 @@ async def lifespan(app: FastAPI):
     # of rebuilding either per-call.
     app.state.triage_graph = build_triage_graph(checkpointer=checkpointer)
     logger.info("Triage graph compiled with Redis checkpointer at %s", settings.redis_url)
+    app.state.detector = DetectorService(app)
+    await app.state.detector.start()
 
     try:
         yield
@@ -154,6 +159,7 @@ async def lifespan(app: FastAPI):
         # Postgres connection pool, then flush any spans still buffered in
         # the OTel BatchSpanProcessor so a graceful shutdown doesn't lose
         # the trace for whatever request was in flight when it started.
+        await app.state.detector.stop()
         await redis_checkpointer_cm.__aexit__(None, None, None)
         await dispose_engine()
         shutdown_telemetry()
@@ -340,6 +346,7 @@ def _ticket_to_response(ticket: Ticket, *, similar_tickets_considered: int = 0) 
         ticket_id=ticket.id,
         title=ticket.title,
         environment=EnvironmentEnum(ticket.environment),
+        source=ticket.source,
         stack_trace=ticket.stack_trace,
         extracted_error=ticket.extracted_error,
         affected_file=ticket.affected_file,
@@ -407,7 +414,7 @@ def _build_initial_state(ticket_id: str, payload: TicketCreate) -> TicketState:
     }
 
 
-async def _persist_triaged_ticket(payload: TicketCreate, result_state: dict, db: AsyncSession) -> Ticket:
+async def _persist_triaged_ticket(payload: TicketCreate, result_state: dict, db: AsyncSession, source: str = "human") -> Ticket:
     """
     Persist a completed triage state to Postgres and return the refreshed row.
 
@@ -422,6 +429,7 @@ async def _persist_triaged_ticket(payload: TicketCreate, result_state: dict, db:
         stack_trace=payload.stack_trace,
         environment=payload.environment.value,
         description=payload.description,
+        source=source,
         extracted_error=result_state["extracted_error"],
         exception_message=result_state.get("exception_message") or None,
         affected_file=result_state.get("affected_file"),
@@ -553,10 +561,12 @@ def _sse_data(payload: dict[str, Any]) -> str:
     """Encode one Server-Sent Event data frame."""
     return f"data: {json.dumps(payload)}\n\n"
 
-async def _run_triage_pipeline(
+async def run_triage(
     payload: TicketCreate,
-    request: Request,
+    *,
+    graph,
     db: AsyncSession,
+    source: str = "human",
 ) -> TicketResponse:
     """
     End-to-end triage flow, shared by every ingestion route (a human filing
@@ -590,7 +600,6 @@ async def _run_triage_pipeline(
     ticket_id = uuid.uuid4()
     initial_state = _build_initial_state(str(ticket_id), payload)
 
-    graph = request.app.state.triage_graph
     run_config = {
         "configurable": {
             # thread_id scopes checkpoint state per-ticket in Redis, so
@@ -631,11 +640,20 @@ async def _run_triage_pipeline(
             detail="Triage pipeline failed to process this ticket.",
         )
 
-    ticket_record = await _persist_triaged_ticket(payload, result_state, db)
+    ticket_record = await _persist_triaged_ticket(payload, result_state, db, source=source)
 
     return _ticket_to_response(
         ticket_record, similar_tickets_considered=len(result_state.get("retrieved_context", []))
     )
+
+
+async def _run_triage_pipeline(
+    payload: TicketCreate,
+    request: Request,
+    db: AsyncSession,
+    source: str = "human",
+) -> TicketResponse:
+    return await run_triage(payload, graph=request.app.state.triage_graph, db=db, source=source)
 
 
 @app.get(
@@ -696,7 +714,7 @@ async def stream_triage(
                         }
                     )
 
-            ticket_record = await _persist_triaged_ticket(payload, result_state, db)
+            ticket_record = await _persist_triaged_ticket(payload, result_state, db, source="human")
             yield _sse_data(
                 {
                     "event": "done",
@@ -732,7 +750,7 @@ async def triage_ticket(
     db: AsyncSession = Depends(get_db),
 ) -> TicketResponse:
     """Human/manual entry point -- see `_run_triage_pipeline` for the actual flow."""
-    return await _run_triage_pipeline(payload, request, db)
+    return await _run_triage_pipeline(payload, request, db, source="human")
 
 
 @app.post(
@@ -761,7 +779,31 @@ async def ingest_crash_report(
     to the rest of the system.
     """
     payload = crash_report_to_ticket_create(report)
-    return await _run_triage_pipeline(payload, request, db)
+    return await _run_triage_pipeline(payload, request, db, source="crash")
+
+
+@app.post(
+    "/api/v1/ingest/alert",
+    response_model=TicketResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["triage"],
+    summary="Auto-ticket a Prometheus metric alert through the normal triage pipeline",
+)
+async def ingest_metric_alert(
+    alert: MetricAlert,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> TicketResponse:
+    payload = metric_alert_to_ticket_create(alert)
+    return await _run_triage_pipeline(payload, request, db, source="metric")
+
+
+@app.get("/api/v1/detector/status", tags=["ops"])
+async def detector_status(request: Request) -> dict:
+    detector = getattr(request.app.state, "detector", None)
+    if detector is None:
+        return {"enabled": False, "rules": []}
+    return detector.status()
 
 
 @app.get(

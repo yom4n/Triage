@@ -3,6 +3,7 @@ export type Environment = "development" | "staging" | "production";
 export type Severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
 
 export type TriageStatus = "COMPLETED" | "ESCALATED_TO_HUMAN";
+export type TicketSource = "human" | "crash" | "metric" | string;
 
 export type TriagePayload = {
   title: string;
@@ -16,6 +17,7 @@ export type TriageResponse = {
   ticket_id: string;
   title: string;
   environment: Environment;
+  source: TicketSource;
   stack_trace: string;
   extracted_error: string;
   affected_file: string | null;
