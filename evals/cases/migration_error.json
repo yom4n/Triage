@@ -1,0 +1,12 @@
+{
+  "id": "migration_error",
+  "title": "API errors after orders migration",
+  "stack_trace": "sqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedColumn) column orders.fulfillment_state does not exist\nLINE 1: SELECT orders.id, orders.fulfillment_state FROM orders\n  File \"app/orders/repository.py\", line 58, in list_orders",
+  "environment": "production",
+  "description": "Application code expects a new column but the production migration did not apply.",
+  "expected": {
+    "root_cause_keywords": ["migration", "column", "does not exist", "fulfillment_state"],
+    "severity": "CRITICAL",
+    "should_escalate": false
+  }
+}

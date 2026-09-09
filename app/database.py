@@ -99,6 +99,23 @@ ON tickets USING hnsw (embedding vector_cosine_ops)
 WITH (m = 16, ef_construction = 64)
 """
 
+# `Base.metadata.create_all` only ever CREATEs tables -- it never ALTERs an
+# existing one to add a column the model gained later. Since this project
+# deliberately skips Alembic for zero-setup local dev (see README's
+# "intentionally out of scope"), new columns are added here with idempotent
+# ADD COLUMN IF NOT EXISTS so a dev database created before a given phase
+# picks up that phase's schema on the next boot. A real deployment runs
+# versioned migrations in CI/CD instead.
+_ADDITIVE_COLUMN_DDL = [
+    # Phase 1: sandboxed fix verification (verify_fix_node in app/graph.py)
+    "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS fix_verified BOOLEAN NOT NULL DEFAULT false",
+    "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS fix_verification_status VARCHAR(30) NOT NULL DEFAULT 'NOT_ATTEMPTED'",
+    "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS fix_verification_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS fix_test_command VARCHAR(300)",
+    "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS fix_test_output_tail TEXT",
+    "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'human'",
+]
+
 
 async def init_models() -> None:
     """
@@ -118,6 +135,10 @@ async def init_models() -> None:
         await conn.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
         await conn.run_sync(Base.metadata.create_all)
         await conn.exec_driver_sql(_HNSW_INDEX_DDL)
+        # Backfill columns added after this table was first created on an
+        # existing dev volume (no-op on a fresh DB create_all just built).
+        for ddl in _ADDITIVE_COLUMN_DDL:
+            await conn.exec_driver_sql(ddl)
 
 
 async def dispose_engine() -> None:

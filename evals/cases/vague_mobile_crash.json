@@ -1,0 +1,12 @@
+{
+  "id": "vague_mobile_crash",
+  "title": "Mobile app occasionally closes",
+  "stack_trace": "Crash reporter payload: Fatal Exception: unknown signal 0x00000000; native frames stripped; symbolication unavailable for build 426; thread state omitted.",
+  "environment": "production",
+  "description": "Only aggregated mobile crash text is available and the native frames are not symbolicated.",
+  "expected": {
+    "root_cause_keywords": ["unknown", "symbolication", "mobile", "crash"],
+    "severity": "MEDIUM",
+    "should_escalate": true
+  }
+}

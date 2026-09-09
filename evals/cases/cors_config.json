@@ -1,0 +1,12 @@
+{
+  "id": "cors_config",
+  "title": "Browser blocks admin API calls from new domain",
+  "stack_trace": "Access to fetch at 'https://api.example.com/admin/users' from origin 'https://admin-new.example.com' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.",
+  "environment": "production",
+  "description": "Admin frontend moved to a new host but the API allow-origin list was not updated.",
+  "expected": {
+    "root_cause_keywords": ["CORS", "origin", "allow", "configuration"],
+    "severity": "MEDIUM",
+    "should_escalate": false
+  }
+}

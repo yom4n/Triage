@@ -1,0 +1,12 @@
+{
+  "id": "vague_blank_screen",
+  "title": "Dashboard shows blank screen",
+  "stack_trace": "Browser console excerpt: Error: Minified React error #418; visit react.dev/errors/418 for the full message or use the non-minified dev environment for full errors and warnings.",
+  "environment": "production",
+  "description": "Several users report a blank dashboard after login. No reproducible steps or unminified stack available.",
+  "expected": {
+    "root_cause_keywords": ["react", "minified", "blank", "dashboard"],
+    "severity": "MEDIUM",
+    "should_escalate": true
+  }
+}

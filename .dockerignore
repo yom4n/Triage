@@ -1,0 +1,12 @@
+.venv
+__pycache__
+*.pyc
+.git
+frontend/node_modules
+frontend/.next
+.pytest_cache
+bridge_state.json
+bridge.js
+*.md
+!README.md
+.env

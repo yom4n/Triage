@@ -1,0 +1,12 @@
+{
+  "id": "disk_full",
+  "title": "Upload service cannot write temporary files",
+  "stack_trace": "OSError: [Errno 28] No space left on device: '/tmp/upload-9fb2.tmp'\n  File \"app/uploads/storage.py\", line 91, in stage_upload\n    with open(tmp_path, 'wb') as handle:",
+  "environment": "production",
+  "description": "Image uploads fail because the container temporary volume is full.",
+  "expected": {
+    "root_cause_keywords": ["disk", "space", "device", "tmp"],
+    "severity": "HIGH",
+    "should_escalate": false
+  }
+}

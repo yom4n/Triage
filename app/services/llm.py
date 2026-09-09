@@ -164,6 +164,131 @@ async def _call_ollama_structured(*, system: str, user: str, schema_model: type[
         return parsed
 
 
+async def _call_ollama_text(*, system: str, user: str) -> str:
+    """
+    Free-form completion via Ollama's `/api/chat` -- no `format` schema,
+    so no grammar-constrained decoding.
+
+    Exists solely for propose_fix_node's full-file draft (app/graph.py).
+    `_call_ollama_structured`'s grammar constraint is cheap for the flat,
+    short-field schemas the rest of the pipeline uses, but for a large
+    open-ended string field (a whole source file, JSON-escaped quote/
+    newline-by-quote/newline under grammar validation) it is dramatically
+    slower: measured >400s for an 81-line file against this model/hardware,
+    versus 2.7s for a trivial unconstrained call. Free-form text sidesteps
+    the grammar entirely and lets the model stream tokens at its normal
+    rate; propose_fix_node parses the result with a plain-text delimiter
+    format instead of JSON-schema validation.
+    """
+    settings = get_settings()
+    url = f"{settings.ollama_base_url}/api/chat"
+    payload = {
+        "model": settings.ollama_chat_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.1},
+    }
+
+    tracer = get_tracer()
+    with tracer.start_as_current_span("llm.call") as span:
+        span.set_attribute("llm.provider", "ollama")
+        span.set_attribute("llm.model", settings.ollama_chat_model)
+        span.set_attribute("llm.structured", False)
+
+        try:
+            async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "timeout"))
+            raise LLMTimeoutError(
+                f"Ollama chat request timed out after {settings.llm_timeout_seconds}s "
+                f"(model={settings.ollama_chat_model})."
+            ) from exc
+        except httpx.ConnectError as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "connect_error"))
+            raise LLMTimeoutError(
+                f"Could not reach Ollama at {settings.ollama_base_url}. "
+                "Start it with `ollama serve`, and ensure the model is pulled: "
+                f"`ollama pull {settings.ollama_chat_model}`."
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, f"http_{exc.response.status_code}"))
+            raise LLMError(
+                f"Ollama chat request failed with {exc.response.status_code}: {exc.response.text[:300]}"
+            ) from exc
+
+        body = response.json()
+        record_llm_usage(
+            span,
+            provider="ollama",
+            model=settings.ollama_chat_model,
+            prompt_tokens=body.get("prompt_eval_count"),
+            completion_tokens=body.get("eval_count"),
+        )
+
+        try:
+            content = body["message"]["content"]
+        except (KeyError, TypeError) as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "malformed_response_shape"))
+            raise LLMMalformedOutputError(f"Unexpected Ollama response shape: {body!r}") from exc
+
+        span.set_status(trace.Status(trace.StatusCode.OK))
+        return content
+
+
+async def call_code_fix_text(*, system: str, user: str, node_name: str) -> str:
+    """
+    Ollama-only free-text counterpart to `call_structured`, for
+    propose_fix_node's full-file draft only (see `_call_ollama_text`'s
+    docstring for why this path exists at all). Retry shape mirrors
+    `call_structured`: malformed/empty output retried up to
+    `llm_max_retries` additional times, a timeout is not retried.
+
+    Anthropic's structured output doesn't have the grammar-decoding
+    slowness this works around -- `messages.parse` validates server-side,
+    not via local grammar-constrained sampling -- so propose_fix_node
+    keeps using `call_structured` for that provider and only calls this
+    function when `settings.llm_provider == "ollama"`.
+    """
+    settings = get_settings()
+    if settings.llm_provider != "ollama":
+        raise LLMError(
+            f"call_code_fix_text only supports the 'ollama' provider; "
+            f"configured provider is '{settings.llm_provider}' -- use call_structured instead."
+        )
+
+    last_error: Exception | None = None
+    attempts = settings.llm_max_retries + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            content = await _call_ollama_text(system=system, user=user)
+            if not content or not content.strip():
+                raise LLMMalformedOutputError("Ollama returned empty content")
+            if attempt > 1:
+                logger.info("%s: LLM call succeeded on attempt %d/%d", node_name, attempt, attempts)
+            return content
+        except LLMTimeoutError:
+            raise
+        except LLMError as exc:
+            last_error = exc
+            logger.warning(
+                "%s: LLM call attempt %d/%d failed (%s): %s",
+                node_name, attempt, attempts, settings.llm_provider, exc,
+            )
+
+    raise LLMMalformedOutputError(
+        f"{node_name}: exhausted {attempts} attempt(s) against '{settings.llm_provider}'"
+    ) from last_error
+
+
 # ---------------------------------------------------------------------------
 # Anthropic backend
 # ---------------------------------------------------------------------------

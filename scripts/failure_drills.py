@@ -41,6 +41,15 @@ Drill C -- Corrupted Response
     fallback is keyed on "the LLM call didn't succeed", not on one
     specific exception subtype.
 
+Drill D -- Unverifiable Fix (Phase 1)
+    Lets triage succeed normally, then patches the sandbox verifier
+    (`app.graph.verify_patch_in_sandbox`) to always report the proposed
+    fix FAILED its tests. Proves the generate -> verify retry loop is
+    bounded and terminates in escalation: the ticket comes back 201 with
+    `fix_verification_status="FAILED_MAX_ATTEMPTS"`, a diff attached for a
+    human, and crucially **no `fix_pr_url`** -- a fix that never passed
+    the repo's tests is never turned into a pull request.
+
 Each drill also implicitly exercises the Redis-backed LangGraph
 checkpointer: every ticket gets a fresh `thread_id` (its UUID), and a
 checkpoint is written after every node regardless of which branch the
@@ -64,6 +73,7 @@ from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
 import app.graph as graph_module  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services.llm import LLMError, LLMMalformedOutputError  # noqa: E402
+from app.services.sandbox import SandboxResult  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("failure_drills")
@@ -171,6 +181,110 @@ def drill_c_corrupted_response(client: TestClient) -> None:
     logger.info("Drill C PASSED: corrupted LLM output degraded to ESCALATED_TO_HUMAN, no 5xx, no dropped ticket data")
 
 
+def drill_d_unverifiable_fix(client: TestClient) -> None:
+    """
+    Drill D: a fix is generated, but every sandbox run reports it FAILED the
+    tests -> the generate->verify loop retries up to sandbox_max_attempts,
+    then escalates with the diff attached and opens NO PR.
+
+    The fix sub-graph only runs for a COMPLETED triage that also has an
+    affected file and a configured GITHUB_REPO. Rather than depend on the
+    live LLM extracting a file and on network access to GitHub, this drill
+    stubs the two external seams generate_fix_node uses -- the GitHub file
+    fetch and the LLM fix call -- so it isolates exactly the
+    verify -> retry -> escalate behavior Phase 1 adds. Triage itself still
+    runs for real against the live backend.
+    """
+    logger.info("Drill D: Unverifiable Fix -- stubbing fix generation, forcing every sandbox run to FAIL")
+
+    from app.services.github import GitHubFile
+
+    sandbox_calls = {"n": 0}
+    generate_calls = {"n": 0}
+
+    # A Node/V8-style trace so log_inspector_node's unconditional
+    # `_fallback_extract_file_line` backstop populates state["affected_file"]
+    # even without the LLM naming one -- generate_fix_node needs a file to
+    # proceed past its first guard.
+    node_trace = (
+        "TimeoutError: connection pool exhausted after 5s\n"
+        "    at chargeCard (src/charge.js:12:20)\n"
+        "    at processJob (src/worker.js:88:10)"
+    )
+
+    async def _fake_resolve_and_fetch(state):
+        return "src/charge.js", GitHubFile(
+            path="src/charge.js",
+            content="function chargeCard(amount) {\n  return pool.acquire(5);\n}\n",
+            sha="deadbeef" * 5,
+        )
+
+    async def _fake_generate_one_fix(*, affected_file, file_content, state, prior_failure):
+        generate_calls["n"] += 1
+        return graph_module.CodeFixOutput(
+            fixed_file_content=(
+                f"function chargeCard(amount) {{\n"
+                f"  // attempt {generate_calls['n']}: widen the pool acquire timeout\n"
+                f"  return pool.acquire({5 + generate_calls['n']});\n"
+                f"}}\n"
+            ),
+            explanation=f"Attempt {generate_calls['n']} at fixing the pool timeout.",
+            confidence=0.8,
+        )
+
+    async def _always_fails(**kwargs):
+        sandbox_calls["n"] += 1
+        return SandboxResult(
+            ran=True,
+            passed=False,
+            exit_code=1,
+            output_tail=(
+                "=== SANDBOX: running tests -> python -m pytest -q ===\n"
+                "test_charge.py::test_pool_not_exhausted FAILED\n"
+                "E   AssertionError: connection pool still exhausted after fix\n"
+                "1 failed, 3 passed -- simulated persistent failure for chaos drill D"
+            ),
+            duration_s=2.1,
+            test_command="python -m pytest -q",
+        )
+
+    payload = _sample_payload("Drill D: fix never passes sandbox tests")
+    payload["stack_trace"] = node_trace
+
+    with (
+        patch.object(graph_module, "_resolve_and_fetch_file", new=AsyncMock(side_effect=_fake_resolve_and_fetch)),
+        patch.object(graph_module, "_generate_one_fix", new=AsyncMock(side_effect=_fake_generate_one_fix)),
+        patch.object(graph_module, "verify_patch_in_sandbox", new=AsyncMock(side_effect=_always_fails)),
+        patch.object(graph_module, "open_pull_request", new=AsyncMock(side_effect=AssertionError("open_pr must not run"))),
+    ):
+        response = client.post("/api/v1/triage", json=payload)
+
+    _print_result("Drill D (Unverifiable Fix)", response)
+
+    assert response.status_code == 201, f"expected 201 (graceful degradation), got {response.status_code}"
+    body = response.json()
+
+    if body["status"] != "COMPLETED":
+        logger.warning(
+            "Drill D SKIPPED: triage did not COMPLETE (status=%s) -- the fix sub-graph was "
+            "never reached. Run with a reachable LLM backend for this drill to be meaningful.",
+            body["status"],
+        )
+        return
+
+    assert body["fix_verification_status"] == "FAILED_MAX_ATTEMPTS", body
+    assert not body.get("fix_pr_url"), f"a fix that failed every sandbox run must NOT open a PR: {body.get('fix_pr_url')}"
+    assert body.get("fix_diff"), "the failed fix's diff must still be attached for a human to take over"
+    assert sandbox_calls["n"] >= 2, f"expected the generate->verify loop to retry, sandbox ran {sandbox_calls['n']}x"
+    assert generate_calls["n"] == sandbox_calls["n"], "each retry should re-generate the fix"
+    assert body["fix_verification_status"] in ("FAILED_MAX_ATTEMPTS", "SKIPPED_UNTESTABLE"), body
+    assert body["fix_verification_status"] != "NOT_ATTEMPTED", body
+    logger.info(
+        "Drill D PASSED: fix failed sandbox %dx (max_attempts) -> escalated with diff, no PR opened",
+        sandbox_calls["n"],
+    )
+
+
 def main() -> None:
     logger.info("Starting chaos drills against app.main:app (in-process, real Postgres + Redis)")
 
@@ -185,6 +299,7 @@ def main() -> None:
             ("Drill A", drill_a_database_outage),
             ("Drill B", drill_b_rate_limit),
             ("Drill C", drill_c_corrupted_response),
+            ("Drill D", drill_d_unverifiable_fix),
         ):
             try:
                 drill(client)
@@ -194,9 +309,9 @@ def main() -> None:
 
     logger.info("=" * 78)
     if failures:
-        logger.error("%d/3 drills FAILED: %s", len(failures), [n for n, _ in failures])
+        logger.error("%d/4 drills FAILED: %s", len(failures), [n for n, _ in failures])
         sys.exit(1)
-    logger.info("All 3 chaos drills PASSED -- the engine degrades gracefully under every simulated failure mode.")
+    logger.info("All 4 chaos drills PASSED -- the engine degrades gracefully under every simulated failure mode.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,12 @@
+{
+  "id": "vague_intermittent",
+  "title": "Intermittent failures reported by customer",
+  "stack_trace": "Log excerpt: request_id=unknown status=failed message='operation did not complete successfully' component=web duration_ms=0 error_code=UNCLASSIFIED",
+  "environment": "production",
+  "description": "Customer says the issue happens sometimes but has not provided timestamps, account IDs, or reproduction steps.",
+  "expected": {
+    "root_cause_keywords": ["intermittent", "unknown", "UNCLASSIFIED", "failed"],
+    "severity": "LOW",
+    "should_escalate": true
+  }
+}

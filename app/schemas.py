@@ -127,6 +127,134 @@ class TicketCreate(BaseModel):
         return value
 
 
+class CrashReport(BaseModel):
+    """
+    Raw crash payload posted by a client-side error-capture hook (see
+    `client-sdks/` at the repo root) -- Phase 4 (auto-ticketing from a
+    running app's own crashes), the automated counterpart to a human
+    filling out the `TicketCreate` form by hand.
+
+    Deliberately looser than `TicketCreate`: a browser's `window.onerror`/
+    `unhandledrejection`/React error-boundary handlers hand you whatever
+    the runtime gives them, not a guaranteed 30-character stack trace, so
+    this model accepts a minimal, mostly-optional shape and
+    `crash_report_to_ticket_create()` below does the work of turning it
+    into something that clears `TicketCreate`'s guardrails.
+    """
+
+    # populate_by_name + aliases: the SDK is plain JS/TS and sends
+    # camelCase (`componentStack`, `userAgent`) -- the natural convention
+    # on that side -- while the rest of this backend is snake_case.
+    # extra="ignore" (not "forbid" like TicketCreate) because this is a
+    # cross-repo wire contract: a newer SDK version sending one extra
+    # field should never 422 an otherwise-valid crash report.
+    model_config = ConfigDict(str_strip_whitespace=True, populate_by_name=True, extra="ignore")
+
+    message: str = Field(..., min_length=1, max_length=2000, description="Error.message, or the thrown value's string form.")
+    stack: str | None = Field(default=None, max_length=8000, description="Error.stack, if the runtime populated one.")
+    component_stack: str | None = Field(
+        default=None, max_length=8000, alias="componentStack",
+        description="React error-boundary componentStack, if this came from CrashBoundary.tsx.",
+    )
+    url: str | None = Field(default=None, max_length=2000, description="window.location.href at the time of the crash.")
+    user_agent: str | None = Field(default=None, max_length=500, alias="userAgent")
+    source: str = Field(
+        default="window.onerror", max_length=50,
+        description="Which hook fired: window.onerror | unhandledrejection | react-error-boundary.",
+    )
+    environment: EnvironmentEnum = Field(
+        default=EnvironmentEnum.PRODUCTION,
+        description="Deployment tier the crashed app is running as. Defaults to production since that's the typical deployment for a monitored app.",
+    )
+
+
+class MetricAlert(BaseModel):
+    """Loose Prometheus alert payload accepted by metric ingestion and detector."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
+
+    rule_name: str = Field(..., min_length=1, max_length=200)
+    expr: str = Field(..., min_length=1, max_length=2000)
+    value: float
+    threshold: float
+    severity_hint: str | None = Field(default=None, max_length=50)
+    description: str | None = Field(default=None, max_length=2000)
+    labels: dict[str, str] = Field(default_factory=dict)
+    environment: EnvironmentEnum = EnvironmentEnum.PRODUCTION
+
+
+def crash_report_to_ticket_create(report: CrashReport) -> TicketCreate:
+    """
+    Normalize a loose, runtime-provided `CrashReport` into a valid
+    `TicketCreate` -- the one adapter function every client-side capture
+    hook's output must pass through before it can enter the same pipeline
+    a human-filed ticket does. Centralizing this here (rather than
+    duplicating ad hoc mapping logic at each ingestion route) is what
+    keeps the language/framework-specific bit (a browser crash shape)
+    from leaking into the pipeline itself -- see the note in README.md
+    about keeping ingestion adapters thin and swappable.
+    """
+    message = report.message.strip()
+    title = message[:200]
+    if len(title) < 5:
+        # TicketCreate requires a 5-char title; a bare thrown value like
+        # "x" or "" clears CrashReport's min_length=1 but not that floor.
+        title = (f"Crash: {title}" if title else "Unhandled client-side crash")[:200]
+
+    trace_parts = [part.strip() for part in (report.stack, report.component_stack) if part and part.strip()]
+    if not trace_parts:
+        # No real stack available (some thrown values carry none) --
+        # fall back to the message itself so there's still real content
+        # to extract from, rather than 422ing a crash we could triage.
+        trace_parts.append(message)
+    stack_trace = "\n\nComponent stack:\n".join(trace_parts) if len(trace_parts) > 1 else trace_parts[0]
+
+    context_line = f"source: {report.source} | url: {report.url or 'unknown'}"
+    stack_trace = f"{stack_trace}\n{context_line}"[:8000]
+    if len(stack_trace.strip()) < _MIN_STACK_TRACE_LEN:
+        # Still short (e.g. a one-word message, no stack, no url) -- pad
+        # deterministically with real metadata rather than junk filler.
+        stack_trace = f"{stack_trace}\nreported_at: client-side crash capture"[:8000]
+
+    description_parts = [context_line]
+    if report.user_agent:
+        description_parts.append(f"user_agent: {report.user_agent}")
+    description = " | ".join(description_parts)[:2000]
+
+    return TicketCreate(
+        title=title,
+        stack_trace=stack_trace,
+        environment=report.environment,
+        description=description,
+    )
+
+
+def metric_alert_to_ticket_create(alert: MetricAlert) -> TicketCreate:
+    """Normalize a Prometheus threshold breach into a guardrail-clearing ticket."""
+    severity = f" ({alert.severity_hint})" if alert.severity_hint else ""
+    title = f"Metric alert: {alert.rule_name}{severity}"[:200]
+    label_text = ", ".join(f"{key}={value}" for key, value in sorted(alert.labels.items())) or "none"
+    description = alert.description or (
+        f"Prometheus rule {alert.rule_name} breached threshold {alert.threshold} with value {alert.value}."
+    )
+    stack_trace = (
+        "Prometheus metric threshold breach\n"
+        f"rule_name: {alert.rule_name}\n"
+        f"expr: {alert.expr}\n"
+        f"value: {alert.value}\n"
+        f"threshold: {alert.threshold}\n"
+        f"severity_hint: {alert.severity_hint or 'unspecified'}\n"
+        f"labels: {label_text}\n"
+        f"description: {description}"
+    )[:8000]
+    return TicketCreate(
+        title=title,
+        stack_trace=stack_trace,
+        environment=alert.environment,
+        description=description[:2000],
+    )
+
+
 class TicketResponse(BaseModel):
     """Structured triage result returned to the calling system."""
 
@@ -138,6 +266,12 @@ class TicketResponse(BaseModel):
     ticket_id: uuid.UUID
     title: str
     environment: EnvironmentEnum
+    source: str = "human"
+    # Round-tripped so a dashboard fetching this via GET /api/v1/tickets can
+    # render the original trace without a second request -- POST callers
+    # already have it (they sent it), but a list/detail view reading a
+    # ticket back has no other source for it.
+    stack_trace: str
     extracted_error: str
     affected_file: str | None = None
     affected_line: int | None = None
@@ -162,4 +296,25 @@ class TicketResponse(BaseModel):
     # automated fix -- ESCALATED_TO_HUMAN means it is a hand-off note.
     status: TriageStatusEnum = TriageStatusEnum.COMPLETED
     escalation_reason: str | None = None
+    # The fix sub-graph's outcome (app/graph.py: generate_fix -> verify_fix
+    # -> open_pr | fix_escalation). fix_attempted distinguishes "never
+    # tried" (escalated ticket, no affected_file) from "tried" -- check
+    # fix_skipped_reason for why it stopped short of a PR, or fix_pr_url for
+    # the PR itself. fix_diff is populated whenever the LLM produced a
+    # change, even when no PR was opened.
+    fix_attempted: bool = False
+    fix_skipped_reason: str | None = None
+    fix_diff: str | None = None
+    fix_pr_url: str | None = None
+    fix_branch_name: str | None = None
+    # Phase 1: sandboxed verification. fix_verified is True only when the
+    # monitored repo's own test suite passed against this exact change in a
+    # Docker sandbox before the PR was opened. fix_verification_status is
+    # one of PASSED | FAILED_MAX_ATTEMPTS | SKIPPED_NO_SANDBOX |
+    # SKIPPED_UNTESTABLE | NOT_ATTEMPTED.
+    fix_verified: bool = False
+    fix_verification_status: str = "NOT_ATTEMPTED"
+    fix_verification_attempts: int = 0
+    fix_test_command: str | None = None
+    fix_test_output_tail: str | None = None
     created_at: datetime

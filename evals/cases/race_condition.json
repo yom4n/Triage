@@ -1,0 +1,12 @@
+{
+  "id": "race_condition",
+  "title": "Duplicate invoice numbers generated concurrently",
+  "stack_trace": "IntegrityError: duplicate key value violates unique constraint \"invoices_number_key\"\nDETAIL: Key (number)=(INV-2026-004219) already exists.\n  File \"app/billing/invoices.py\", line 144, in create_invoice",
+  "environment": "production",
+  "description": "Two workers reserve the same next invoice number when jobs run at the same time.",
+  "expected": {
+    "root_cause_keywords": ["race", "concurrent", "duplicate", "unique"],
+    "severity": "HIGH",
+    "should_escalate": false
+  }
+}

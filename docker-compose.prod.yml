@@ -1,0 +1,68 @@
+# For this compose file, POSTGRES_HOST in .env must be set to postgres, not localhost.
+services:
+  backend:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The non-root `app` user needs the host docker socket's group to drive
+    # the sandbox (app/services/sandbox.py). Find the gid on the VM with
+    # `getent group docker | cut -d: -f3` and set DOCKER_GID in .env; 999 is
+    # the common default on Debian/Ubuntu hosts.
+    group_add:
+      - "${DOCKER_GID:-999}"
+    # Ollama runs on the VM host, not in a container -- let the backend reach
+    # it at http://host.docker.internal:11434 (set OLLAMA_BASE_URL to that).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - triage_net
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-triage_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-triage_password}
+      POSTGRES_DB: ${POSTGRES_DB:-triage_engine}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-triage_user} -d ${POSTGRES_DB:-triage_engine}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - triage_net
+
+  redis:
+    image: redis:alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - triage_net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  triage_net:
+    driver: bridge
