@@ -7,6 +7,16 @@ services:
       - "8000:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    # The non-root `app` user needs the host docker socket's group to drive
+    # the sandbox (app/services/sandbox.py). Find the gid on the VM with
+    # `getent group docker | cut -d: -f3` and set DOCKER_GID in .env; 999 is
+    # the common default on Debian/Ubuntu hosts.
+    group_add:
+      - "${DOCKER_GID:-999}"
+    # Ollama runs on the VM host, not in a container -- let the backend reach
+    # it at http://host.docker.internal:11434 (set OLLAMA_BASE_URL to that).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
