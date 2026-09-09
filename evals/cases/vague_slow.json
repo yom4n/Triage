@@ -1,0 +1,12 @@
+{
+  "id": "vague_slow",
+  "title": "Application feels slow",
+  "stack_trace": "Synthetic monitor warning: transaction duration exceeded baseline for route group unknown; sampled trace missing spans; no exception captured in current telemetry window.",
+  "environment": "production",
+  "description": "Support reports general slowness but cannot identify a failing endpoint or customer segment.",
+  "expected": {
+    "root_cause_keywords": ["slow", "latency", "baseline", "unknown"],
+    "severity": "LOW",
+    "should_escalate": true
+  }
+}

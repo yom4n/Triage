@@ -1,0 +1,12 @@
+{
+  "id": "cache_stampede",
+  "title": "Catalog slows after cache expiry",
+  "stack_trace": "TimeoutError: Redis command GET catalog:home timed out after 1000ms\n  File \"app/catalog/cache.py\", line 55, in get_or_rebuild\n    return await redis.get(key)\nupstream p95 latency exceeded 12s",
+  "environment": "production",
+  "description": "Many workers rebuild the same expired catalog cache key and overload Redis plus the origin query.",
+  "expected": {
+    "root_cause_keywords": ["cache", "redis", "stampede", "timeout"],
+    "severity": "HIGH",
+    "should_escalate": false
+  }
+}

@@ -58,3 +58,33 @@ export type IncidentRecord = {
   response: TriageResponse;
   git_diff?: string;
 };
+
+export type EvalScorecardAggregate = {
+  case_count: number;
+  root_cause_hit_rate: number;
+  severity_accuracy: number;
+  escalation: {
+    precision: number;
+    recall: number;
+    f1: number;
+    true_positives: number;
+    predicted: number;
+    expected: number;
+  };
+  fix_verification_rate: number;
+  fix_attempted_count: number;
+  fix_verification_passed_count: number;
+  mean_fix_verification_attempts_over_passed: number;
+};
+
+export type EvalScorecard = {
+  available: true;
+  generated_at: string;
+  mode: "offline" | "full" | string;
+  aggregate: EvalScorecardAggregate;
+  cases: unknown[];
+};
+
+export type EvalScorecardUnavailable = {
+  available: false;
+};

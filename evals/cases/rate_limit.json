@@ -1,0 +1,12 @@
+{
+  "id": "rate_limit",
+  "title": "Search indexing jobs rejected by vendor",
+  "stack_trace": "HTTPError: 429 Too Many Requests for url: https://search.example.com/v1/index\n  File \"app/search/indexer.py\", line 119, in flush_batch\n    response.raise_for_status()\nRetry-After: 60",
+  "environment": "staging",
+  "description": "Bulk reindex sends too many batches without honoring vendor rate limits.",
+  "expected": {
+    "root_cause_keywords": ["rate", "limit", "429", "Retry-After"],
+    "severity": "MEDIUM",
+    "should_escalate": false
+  }
+}

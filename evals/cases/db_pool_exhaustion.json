@@ -1,0 +1,12 @@
+{
+  "id": "db_pool_exhaustion",
+  "title": "Checkout API exhausts Postgres pool under load",
+  "stack_trace": "Traceback (most recent call last):\n  File \"app/db.py\", line 44, in acquire\n    conn = await pool.acquire(timeout=5)\nTimeoutError: QueuePool limit of size 10 overflow 0 reached, connection timed out",
+  "environment": "production",
+  "description": "Spike in checkout traffic causes requests to wait on database connections until they time out.",
+  "expected": {
+    "root_cause_keywords": ["pool", "connection", "exhausted", "timeout"],
+    "severity": "CRITICAL",
+    "should_escalate": false
+  }
+}

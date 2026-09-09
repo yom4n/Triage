@@ -1,0 +1,12 @@
+{
+  "id": "jwt_expiry",
+  "title": "Mobile clients receive unauthorized responses",
+  "stack_trace": "jwt.exceptions.ExpiredSignatureError: Signature has expired\n  File \"app/auth/jwt.py\", line 76, in decode_token\n    payload = jwt.decode(token, key, algorithms=['RS256'])\nHTTP 401 returned for refresh-token exchange",
+  "environment": "production",
+  "description": "Users are forced to log in repeatedly after refresh token rotation changed token lifetimes.",
+  "expected": {
+    "root_cause_keywords": ["jwt", "expired", "token", "Signature"],
+    "severity": "HIGH",
+    "should_escalate": false
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "id": "null_deref",
+  "title": "Profile page crashes on missing user settings",
+  "stack_trace": "TypeError: Cannot read properties of undefined (reading 'timezone')\n    at renderProfile (src/profile/settings.tsx:87:29)\n    at ProfilePage (src/profile/page.tsx:42:12)",
+  "environment": "production",
+  "description": "A subset of older accounts do not have settings rows and the profile page crashes immediately.",
+  "expected": {
+    "root_cause_keywords": ["undefined", "null", "timezone", "settings"],
+    "severity": "HIGH",
+    "should_escalate": false
+  }
+}

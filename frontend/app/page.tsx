@@ -3,6 +3,7 @@
 import {
   Activity,
   AlertTriangle,
+  BarChart3,
   CheckCircle2,
   ChevronRight,
   ClipboardList,
@@ -18,6 +19,8 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import AgentRun from "./components/AgentRun";
 import type {
   Environment,
+  EvalScorecard,
+  EvalScorecardUnavailable,
   IncidentRecord,
   ProblemResponse,
   Severity,
@@ -75,11 +78,13 @@ export default function Home() {
   const [ticketsError, setTicketsError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>("live");
   const [detectorStatus, setDetectorStatus] = useState<DetectorStatus | null>(null);
+  const [scorecard, setScorecard] = useState<EvalScorecard | EvalScorecardUnavailable | null>(null);
 
   useEffect(() => {
     checkHealth();
     loadTickets();
     loadDetectorStatus();
+    loadScorecard();
   }, []);
 
   async function loadTickets() {
@@ -153,6 +158,17 @@ export default function Home() {
       }
     } catch {
       setDetectorStatus(null);
+    }
+  }
+
+  async function loadScorecard() {
+    try {
+      const response = await fetch("/api/evals/scorecard", { cache: "no-store" });
+      if (response.ok) {
+        setScorecard((await response.json()) as EvalScorecard | EvalScorecardUnavailable);
+      }
+    } catch {
+      setScorecard({ available: false });
     }
   }
 
@@ -297,6 +313,7 @@ export default function Home() {
               onSelect={setSelectedId}
               onRefresh={loadTickets}
               detectorStatus={detectorStatus}
+              scorecard={scorecard}
             />
 
             <TicketDetail incident={selectedIncident} gitDiff={selectedIncident?.git_diff} />
@@ -426,7 +443,8 @@ function Dashboard({
   onFilterChange,
   onSelect,
   onRefresh,
-  detectorStatus
+  detectorStatus,
+  scorecard
 }: {
   incidents: IncidentRecord[];
   allCount: number;
@@ -444,6 +462,7 @@ function Dashboard({
   onSelect: (id: string) => void;
   onRefresh: () => void;
   detectorStatus: DetectorStatus | null;
+  scorecard: EvalScorecard | EvalScorecardUnavailable | null;
 }) {
   return (
     <section className="panel dashboard-panel">
@@ -468,6 +487,7 @@ function Dashboard({
       ) : null}
 
       <DetectorStrip status={detectorStatus} />
+      <EvalScorecardCard scorecard={scorecard} />
 
       <div className="stats-grid">
         <Stat icon={<ClipboardList size={18} />} label="Total" value={stats.total.toString()} />
@@ -532,6 +552,48 @@ function Dashboard({
         )}
       </div>
     </section>
+  );
+}
+
+function EvalScorecardCard({ scorecard }: { scorecard: EvalScorecard | EvalScorecardUnavailable | null }) {
+  if (!scorecard || !scorecard.available) {
+    return (
+      <div className="eval-scorecard unavailable">
+        <div>
+          <BarChart3 size={16} />
+          <span>Eval scorecard</span>
+        </div>
+        <strong>Not run</strong>
+      </div>
+    );
+  }
+
+  const aggregate = scorecard.aggregate;
+  return (
+    <div className="eval-scorecard">
+      <div className="eval-scorecard-head">
+        <div>
+          <BarChart3 size={16} />
+          <span>Eval scorecard</span>
+        </div>
+        <strong>{scorecard.mode}</strong>
+      </div>
+      <div className="eval-metrics">
+        <ScoreMetric label="Root cause" value={aggregate.root_cause_hit_rate} />
+        <ScoreMetric label="Severity" value={aggregate.severity_accuracy} />
+        <ScoreMetric label="Escalation F1" value={aggregate.escalation.f1} />
+        <ScoreMetric label="Fix verify" value={aggregate.fix_verification_rate} />
+      </div>
+    </div>
+  );
+}
+
+function ScoreMetric({ label, value }: { label: string; value: number }) {
+  return (
+    <div>
+      <span>{label}</span>
+      <strong>{Math.round(value * 100)}%</strong>
+    </div>
   );
 }
 

@@ -517,6 +517,90 @@ textarea:focus {
   color: var(--ink, #0f172a);
 }
 
+.eval-scorecard {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.eval-scorecard.unavailable {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  color: var(--muted);
+}
+
+.eval-scorecard-head,
+.eval-scorecard > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.eval-scorecard-head > div,
+.eval-scorecard.unavailable > div {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.eval-scorecard-head svg,
+.eval-scorecard.unavailable svg {
+  color: var(--blue);
+}
+
+.eval-scorecard-head > strong,
+.eval-scorecard.unavailable > strong {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #eef2f7;
+  color: #475569;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.eval-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.eval-metrics div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.eval-metrics span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.eval-metrics strong {
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1;
+}
+
 .status-completed {
   color: var(--green);
   background: #e7f6ef;
@@ -1081,7 +1165,8 @@ textarea:focus {
   }
 
   .agent-run-controls,
-  .agent-fields {
+  .agent-fields,
+  .eval-metrics {
     grid-template-columns: 1fr;
   }
 

@@ -1,0 +1,12 @@
+{
+  "id": "missing_env_var",
+  "title": "Worker cannot boot after config rename",
+  "stack_trace": "RuntimeError: Missing required environment variable STRIPE_WEBHOOK_SECRET\n  File \"app/config.py\", line 31, in require_env\n    raise RuntimeError('Missing required environment variable STRIPE_WEBHOOK_SECRET')",
+  "environment": "production",
+  "description": "Deploy renamed STRIPE_WEBHOOK_SECRETT to STRIPE_WEBHOOK_SECRET but the production secret was not added.",
+  "expected": {
+    "root_cause_keywords": ["environment", "variable", "STRIPE_WEBHOOK_SECRET", "config"],
+    "severity": "HIGH",
+    "should_escalate": false
+  }
+}

@@ -14,6 +14,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -46,6 +47,8 @@ from app.services.telemetry import current_trace_id, instrument_fastapi_app, set
 
 logging.basicConfig(level=get_settings().log_level)
 logger = logging.getLogger("triage_engine")
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SCORECARD_PATH = _REPO_ROOT / "evals" / "scorecard.json"
 
 
 # ===========================================================================
@@ -804,6 +807,20 @@ async def detector_status(request: Request) -> dict:
     if detector is None:
         return {"enabled": False, "rules": []}
     return detector.status()
+
+
+@app.get("/api/v1/evals/scorecard", tags=["ops"])
+async def eval_scorecard() -> dict:
+    if not _SCORECARD_PATH.exists():
+        return {"available": False}
+    try:
+        with _SCORECARD_PATH.open("r", encoding="utf-8") as handle:
+            scorecard = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {"available": False}
+    if isinstance(scorecard, dict):
+        return scorecard
+    return {"available": False}
 
 
 @app.get(

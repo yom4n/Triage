@@ -1,0 +1,12 @@
+{
+  "id": "oom",
+  "title": "Report exporter killed by memory limit",
+  "stack_trace": "MemoryError: Unable to allocate 2.5 GiB for report dataframe\n  File \"app/reports/export.py\", line 203, in build_csv\n    frame = pandas.concat(all_customer_frames)\ncontainer exited with code 137 OOMKilled",
+  "environment": "production",
+  "description": "Large tenant export loads all customer records into memory and the container is OOM killed.",
+  "expected": {
+    "root_cause_keywords": ["memory", "OOM", "allocate", "code 137"],
+    "severity": "HIGH",
+    "should_escalate": false
+  }
+}

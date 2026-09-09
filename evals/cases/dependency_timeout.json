@@ -1,0 +1,12 @@
+{
+  "id": "dependency_timeout",
+  "title": "Payment provider timeout blocks checkout",
+  "stack_trace": "requests.exceptions.ReadTimeout: HTTPSConnectionPool(host='api.payments.example', port=443): Read timed out. (read timeout=3)\n  File \"app/payments.py\", line 112, in capture\n    client.post('/charges', json=payload)",
+  "environment": "production",
+  "description": "Checkout requests fail when the external payment API exceeds the configured three second timeout.",
+  "expected": {
+    "root_cause_keywords": ["timeout", "payment", "dependency", "ReadTimeout"],
+    "severity": "CRITICAL",
+    "should_escalate": false
+  }
+}
